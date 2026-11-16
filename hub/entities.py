@@ -121,6 +121,9 @@ def build_entity_list(user: User, archived: str = "all") -> list[dict]:
             if trials else None,
             "payment_failed": bool(flags.get("payment_failed")),
             "archived_at": gone.isoformat() if gone else None,
+            # minty-web's Xero badge (2026-11-16): connected companies only - a disconnected one keeps its
+            # organisation (2026-11-10) without being connected to it.
+            "xero_org_name": (row.xero_tenant_name or None) if row.status == "connected" else None,
         })
     return entries
 

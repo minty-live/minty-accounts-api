@@ -84,7 +84,18 @@ def test_an_entry_carries_every_field(db, catalogue, subscriptions):
     assert entry == {"id": str(entity.id), "name": "Acme", "status": "connected", "modules": ["PETTY_CASH"],
                      "trial_modules": [], "trial_module_names": [], "last_accessed_at": "2026-11-05T16:30:00+00:00",
                      "last_accessed_by": "Olive Owner", "role": "cashier", "trial_ends_on": None,
-                     "payment_failed": False, "archived_at": None}
+                     "payment_failed": False, "archived_at": None, "xero_org_name": None}
+
+
+def test_a_connected_company_names_its_xero_organisation(db, catalogue, subscriptions):
+    """minty-web's Xero badge (2026-11-16): the organisation's name on hover, for a connected company only. A
+    disconnected company keeps its organisation (2026-11-10) but is not connected, so it gets none."""
+    me = make_user()
+    live = company("Live", member=me)
+    kept = company("Kept", status="disconnected", member=me)
+    Entity.objects.filter(id__in=[live.id, kept.id]).update(xero_org_id=str(uuid.uuid4()), xero_tenant_name="Acme Ltd (HK)")
+    names = {e["name"]: e["xero_org_name"] for e in get(me).json()["entities"]}
+    assert names == {"Live": "Acme Ltd (HK)", "Kept": None}
 
 
 def test_a_superuser_sees_every_company_and_reads_superadmin_where_not_a_member(db, catalogue, subscriptions):

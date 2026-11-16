@@ -14,7 +14,7 @@ fall-through is gone (2026-11-06), so a path not below is a 404, and Flask is no
 | `POST /api/internal/xero/sync` | Django (Phase 3): the one Xero account/contact sync, below |
 | `POST /api/handoff/redeem` | Django (gap 4, 2026-11-09, `hub/handoffs.py`): an app's landing swaps its one-time code for its token |
 | `GET /auth/notices`, `GET /legal/current`, `POST /legal/invite-terms-status` | Django (Phase 5A, `hub/public.py`) |
-| `GET /api/me/entities`, `GET/PATCH /api/me/profile`, `GET /api/me/terms`, `POST /api/me/terms/accept`, `POST /api/me/contact` | Django (Phase 5B, `hub/`) |
+| `GET /api/me/entities`, `GET/PATCH /api/me/profile`, `GET /api/me/terms`, `POST /api/me/terms/accept`, `POST /api/me/contact` | Django (Phase 5B, `hub/`). Each company row carries `xero_org_name` (2026-11-16, minty-web's Xero badge): `xero_tenant_name` for a `connected` company, else null |
 | `GET /api/me/company/users`, `PATCH/DELETE /api/me/company/users/<id>`, `POST /api/me/company/invitations`, `POST .../invitations/<id>/cancel` and `/resend`, `GET/PATCH /api/me/company/integration` | Django (Phase 5C, `hub/company.py`) |
 | `POST /api/me/company/xero/disconnect`, `POST /api/me/company/xero/release` | Django (Phase 5D, `hub/company.py`, `xero/services/disconnect.py`) |
 | `POST /api/me/entities/<id>/archive`, `POST /api/me/entities/<id>/restore` | Django (2026-11-10, `hub/entities.py`): archived companies, below |
