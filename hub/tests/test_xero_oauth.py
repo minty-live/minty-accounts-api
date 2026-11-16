@@ -748,13 +748,16 @@ def test_a_disconnected_claimant_never_blocks(shop, xero):
     assert fresh(old).xero_org_id == "t-1" and xero.probes == []  # kept, untouched, never asked about
 
 
-def test_every_duplicate_claimant_is_examined(shop, xero):
-    first, second = shop["old"], Entity.objects.create(id=uuid.uuid4(), name="Dup", status="connected")
-    hold(first, shop["rival"])
-    hold(second, shop["rival"])
-    xero.tokens[str(second.id)], xero.sees["dup-token"] = ("dup-token", "t-1"), ["t-1"]
-    assert connect.live_org_claimant("t-1", shop["entity"].id, shop["owner"].id) == second
-    assert (fresh(first).xero_org_id, fresh(first).status) == ("t-1", "disconnected")
+def test_every_claimant_is_examined_past_the_disconnected_ones(shop, xero):
+    """minty-db v0.10's uq_entities_connected_xero_org allows one company holding an organisation,
+    but any number of disconnected ones keeping it (2026-11-10): the check walks past them all."""
+    kept = [Entity.objects.create(id=uuid.uuid4(), name=f"Kept {n}", status="disconnected", xero_org_id="t-1")
+            for n in range(2)]
+    live = shop["old"]
+    hold(live, shop["rival"])
+    xero.tokens[str(live.id)], xero.sees["live-token"] = ("live-token", "t-1"), ["t-1"]
+    assert connect.live_org_claimant("t-1", shop["entity"].id, shop["owner"].id) == live
+    assert [(fresh(k).xero_org_id, fresh(k).status) for k in kept] == [("t-1", "disconnected")] * 2
 
 
 def test_an_empty_auth_event_names_the_company_holding_the_org_and_revokes_nothing(shop, xero):
