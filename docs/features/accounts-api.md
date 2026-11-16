@@ -236,6 +236,9 @@ keeps only the membership reads. The payer, pending-handover and only-admin guar
     `retry_after`; the count is per worker, as in Flask), and a send that fails is a 502.
   - The email is Flask's HTML, sent from `INVITE_FROM`. Its accept link is
     `{ACCOUNTS_API_URL}/invitation/accept/<token>?fn=&ln=`, which stays Flask's page until Phase 6.
+    The link is on the button and again as plain text under it ("If the button doesn't open, copy
+    this link into your browser:"). Brevo's click tracking rewrites only the button's link, and its
+    tracker refused every click from 2026-11-16, so the plain copy is the way in when it is down.
     The logo is `/static/img/new_logo.png`, the same file Flask serves, fingerprinted by content.
   - A failed first send keeps the invitation and answers `email_sent: false`.
 - **A role change or a removal** passes Flask's guards, in Flask's order:

@@ -11,7 +11,8 @@ onboarding's invite step both use these (subscription-api's "invite an admin" re
   ``RESEND_COOLDOWN_SECONDS`` after the last send. The cooldown is in process memory, per worker,
   as Flask's: best effort, never a security property.
 - The email is Flask's HTML, from ``INVITE_FROM``; the accept link is on ``ACCOUNTS_API_URL``
-  (``/invitation/accept/<token>``, still Flask's page until Phase 6) with ``?fn=&ln=``; the logo is
+  (``/invitation/accept/<token>``, still Flask's page until Phase 6) with ``?fn=&ln=``, on the button
+  and again as plain text under it (a click tracker rewrites only the button's); the logo is
   ``/static/img/new_logo.png`` fingerprinted by content (the same file Flask serves). A failed send
   returns False and is logged - the caller says so (``email_sent: false``).
 """
@@ -331,6 +332,15 @@ def _build_invitation_html(
                     box-shadow:0 2px 8px rgba(84,211,218,0.35);">
             Accept Invitation
           </a>
+        </td></tr>
+
+        <!-- The link as plain text: a mail service's click tracker rewrites only <a> links, so this
+             one still reaches Minty when the tracker is down -->
+        <tr><td class="m-pad" style="padding:0 40px 24px 40px;text-align:center;">
+          <p style="color:#718096;font-size:12px;line-height:1.5;margin:0;word-break:break-all;">
+            If the button doesn&#39;t open, copy this link into your browser:<br />
+            {accept_url}
+          </p>
         </td></tr>
 
         <!-- Footer -->

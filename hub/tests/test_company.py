@@ -6,6 +6,7 @@ to Django's in-memory outbox."""
 
 from __future__ import annotations
 
+import re
 import uuid
 from datetime import UTC, datetime, timedelta
 
@@ -337,6 +338,20 @@ def test_an_invitation_is_sent_and_listed(shop, settings):
     assert inv.expires_at > datetime.now(UTC) + timedelta(days=6)
     assert [(i["email"], i["role"], i["can_manage"]) for i in users_page(shop["manager"], shop["entity"])[
         "invitations"]] == [("new@test.com", "cashier", True)]
+
+
+def test_the_invitation_also_shows_its_link_as_plain_text(shop, settings):
+    """The button's link can be swapped by the mail service's click tracker (Brevo's tracker refused
+    every click from 2026-11-16), so the email also prints the accept link as text, outside any
+    <a>, where a tracker never rewrites it."""
+    sent = invite(shop["manager"], shop["entity"])
+    message, = mail.outbox
+    inv = Invitation.objects.get(id=sent.json()["invitation_id"])
+    link = f"{settings.ACCOUNTS_API_URL}/invitation/accept/{inv.token}?fn=New&amp;ln=Person"
+    assert message.body.count(f'href="{link}"') == 1
+    assert re.search(r"If the button doesn&#39;t open, copy this link into your browser:\s*<br\s*/>\s*"
+                     + re.escape(link) + r"\s*</p>", message.body)
+    assert message.body.count("<a ") == 1
 
 
 @pytest.mark.parametrize("email, sentence", [
