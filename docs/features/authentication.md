@@ -427,7 +427,7 @@ the stamps the same way, so leaving from the payment module counts as leaving.
 | `REQUIRE_TERMS_AT_SIGNUP`, `CURRENT_TERMS_VERSION`, `CURRENT_PRIVACY_VERSION` | the Terms gate and sign-up consent (section 4) |
 
 Every service's variables are listed in minty-infra's
-[`docs/ENVIRONMENT.md`](https://github.com/minty-oliveandvine/minty-infra/blob/main/docs/ENVIRONMENT.md).
+[`docs/ENVIRONMENT.md`](https://github.com/minty-live/minty-infra/blob/main/docs/ENVIRONMENT.md).
 
 ## 10. Where it is tested
 

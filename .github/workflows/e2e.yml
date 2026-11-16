@@ -1,5 +1,5 @@
 # The whole stack, then one repo's browser specs against it. The workflow body is shared:
-# minty-oliveandvine/.github -> .github/workflows/stack-e2e.yml
+# minty-live/.github -> .github/workflows/stack-e2e.yml
 #
 # It lives here because this repo owns the moving parts the job needs (docker/stack, the
 # token issuer and scripts/e2e_seed.py; moved from Minty 2026-11-06). The schema comes from
@@ -30,7 +30,7 @@ on:
 
 jobs:
   stack:
-    uses: minty-oliveandvine/.github/.github/workflows/stack-e2e.yml@v1
+    uses: minty-live/.github/.github/workflows/stack-e2e.yml@v1
     with:
       suite: ${{ inputs.suite }}
       ref: ${{ inputs.ref }}

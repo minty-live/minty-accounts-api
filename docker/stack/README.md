@@ -169,7 +169,7 @@ redirect URI registered in the Xero app must be `http://localhost:8002/callback`
 ## 9. The CI job (`stack-e2e.yml`)
 
 This repo's `.github/workflows/e2e.yml` (Run workflow) calls the shared
-`minty-oliveandvine/.github/.github/workflows/stack-e2e.yml@v1`, which checks the seven repos
+`minty-live/.github/.github/workflows/stack-e2e.yml@v1`, which checks the seven repos
 out side by side, runs sections 3-5 above with per-run throwaway values (no production secret),
 then one repo's Playwright specs (`minty-web` or `minty-payment-request-web`). Detail:
 `docs/features/stack-e2e.md`.

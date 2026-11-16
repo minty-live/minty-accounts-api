@@ -2,7 +2,7 @@
 
 `docker/stack/` stands up seven repos and one Postgres; `scripts/e2e_seed.py` creates the people
 and companies the browser suites sign in as; `.github/workflows/e2e.yml` (manual, "Run workflow")
-calls the shared `stack-e2e.yml@v1` in the public `minty-oliveandvine/.github`, which does both
+calls the shared `stack-e2e.yml@v1` in the public `minty-live/.github`, which does both
 and then runs one repo's Playwright specs. All three moved here from Minty on 2026-11-06 (the
 Flask retirement, Phase 7): this service issues the tokens now, so Flask is not in the stack and
 Minty is never checked out. How to run the stack by hand: `docker/stack/README.md`.

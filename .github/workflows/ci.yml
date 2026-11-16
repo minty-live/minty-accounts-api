@@ -1,5 +1,5 @@
 # ruff, then pytest. The workflow body is shared:
-# minty-oliveandvine/.github -> .github/workflows/python-api.yml
+# minty-live/.github -> .github/workflows/python-api.yml
 name: ci
 
 on:
@@ -9,6 +9,6 @@ on:
 
 jobs:
   check:
-    uses: minty-oliveandvine/.github/.github/workflows/python-api.yml@v1
+    uses: minty-live/.github/.github/workflows/python-api.yml@v1
     with:
       python-version: "3.13"
