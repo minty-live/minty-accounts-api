@@ -511,7 +511,6 @@ def test_saving_the_companys_settings(shop):
     for body, sentence in (
         ({"name": "   "}, "I need a name for this entity before I can save it."),
         ({"name": "x" * 101}, "That name goes on a bit! Please keep it to 100 characters or fewer."),
-        ({"name": "Other Co"}, "You already have a company called “Other Co”. Choose another name."),
         ({"country_code": "ZZ"}, "Pick one of the countries offered."),
         ({"currency_id": "not-a-uuid"}, "Pick one of the currencies offered."),
         ({"currency_id": str(uuid.uuid4())}, "Pick one of the currencies offered."),
@@ -523,7 +522,15 @@ def test_saving_the_companys_settings(shop):
     assert saved.json()["company"]["name"] == "Olive and Vine Ltd" and saved.json()["message"] == "Settings saved!"
 
 
-def test_a_name_is_unique_per_person_not_across_customers(shop):
+def test_a_name_need_not_be_unique(shop):
+    """Owner, 2026-11-16 (as in Xero): another company's name, the user's own included, is no clash."""
+    assert shop["other"].name == "Other Co"  # the admin's other company (conftest)
+    same = integration(shop["admin"], shop["entity"], {"name": "Other Co"})
+    assert same.status_code == 200 and same.json()["company"]["name"] == "Other Co"
+    assert Entity.objects.filter(name="Other Co").count() == 2
+
+
+def test_another_customer_s_name_may_be_used(shop):
     stranger = make_user("someone@else.test")
     elsewhere = Entity.objects.create(id=uuid.uuid4(), name="Elsewhere Ltd", status="disconnected")
     UserEntity.objects.create(user_id=stranger.id, entity_id=elsewhere.id, role="admin", approved=True)

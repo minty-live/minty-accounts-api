@@ -250,7 +250,7 @@ keeps only the membership reads. The payer, pending-handover and only-admin guar
   - The name, country and currency, with the active countries and currencies to pick from.
   - The Xero state, checked live against Xero's `/connections` with the connector's token from this
     service's own token service. The organisation name is filled in when missing.
-  - A save renames the company (admins only; names are unique per person; 422 sentences), and sets
+  - A save renames the company (admins only; names need not be unique, owner 2026-11-16; 422 sentences), and sets
     the country and currency. A country sent on its own brings its own currency, and the company's
     notes and coins follow the currency (`hub/cash_settings.py`, onboarding-api's copy).
   - A failed save is a 500 and changes nothing.

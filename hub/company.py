@@ -425,10 +425,7 @@ def _save_integration(request: HttpRequest, user: User, entity_id: str, data: di
                 return refuse(request, "I need a name for this entity before I can save it.", 422)
             if len(name) > 100:
                 return refuse(request, "That name goes on a bit! Please keep it to 100 characters or fewer.", 422)
-            # Exact names, case and all, unique per person (owner, 2026-11-03).
-            if Entity.objects.filter(name=name, id__in=UserEntity.objects.filter(user_id=user.id)
-                                     .values("entity_id")).exclude(id=entity_id).exists():
-                return refuse(request, f"You already have a company called “{name}”. Choose another name.", 422)
+            # Names need not be unique, the user's own companies included (owner, 2026-11-16, as in Xero).
             org.name = name
             changed.append("name")
     country_code = str(data.get("country_code") or "").strip().upper()
