@@ -24,6 +24,9 @@ ACCOUNT_SLOTS = (
     "pettycash_account_id",
     "bank_account_id",
     "cash_sale_account_id",
+    # the other two sales accounts' codes (minty-db v0.12, owner 2026-11-17)
+    "electronic_sale_account_id",
+    "delivery_sale_account_id",
     "discrepancy_bank_account_id",
     "discrepancy_account_id",
     "director_account_id",

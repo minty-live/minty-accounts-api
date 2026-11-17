@@ -490,3 +490,14 @@ def test_a_sync_while_any_matching_is_open_only_refreshes_the_copies(connected, 
     assert not AccountInfo.objects.filter(entity_id=entity.id, xero_account_id="x-new").exists()
     assert XeroAccount.objects.filter(entity_id=entity.id, xero_guid="x-new").exists()
 
+
+
+def test_each_sales_accounts_code_counts_as_used(minty):
+    """Owner, 2026-11-17: Electronic Payment's and Delivery's own codes (minty-db v0.12) are used like
+    the Cash Sales account - matching asks for them before Finish."""
+    from xero.services.usage import used_account_ids
+
+    entity = minty["entity"]
+    assert minty["unused"].id not in used_account_ids(entity.id)
+    EntityPettycashSettings.objects.filter(entity_id=entity.id).update(electronic_sale_account_id=minty["unused"].id)
+    assert minty["unused"].id in used_account_ids(entity.id)
