@@ -564,8 +564,6 @@ def _link(entity_id, account: AccountInfo, copy: XeroAccount, batch, user_id, ex
             EntityBillAccountXero.objects.filter(id=holder.id).update(
                 account_code=copy.code or "", account_name=account.name, account_type=copy.xero_type,
                 xero_account_id=copy.xero_guid)
-        if holder is not None and any(r.is_default for r in rows):
-            EntityBillAccountXero.objects.filter(id=holder.id).update(is_default=True)
         blank.exclude(id=holder.id if holder else None).delete()
         BillLine.objects.filter(bill__entity_id=entity_id, account_code__in=old_codes).exclude(
             bill__published="published").update(account_code=copy.code or "", account_id=account.id)
