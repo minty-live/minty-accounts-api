@@ -20,7 +20,7 @@ each picked account takes Xero's identity IN PLACE (Xero id, code, name, type, l
 expense, daily-closing account and sales method keeps pointing at it; the bill codes and unpublished
 bill lines follow a new code; unused unmatched accounts are archived (never deleted); every change is
 logged (``account_change_log``, one batch); ``setup_mode`` becomes ``xero`` and
-``xero_publish_from`` today (owner: only records from then on go to Xero).
+``xero_publish_from`` today (the day Finish ran; no longer a publish cut-off - owner, 2026-11-18).
 
 **Suppliers** (``link_suppliers``) after the replace: each own supplier is linked to the Xero
 contact with the same name (case and surrounding spaces ignored; the active one first, else the
@@ -34,8 +34,8 @@ again from scratch, nothing mirrored, archived or deleted before Finish) or ``ch
 changed on the same page, prefilled; the company stays connected). The scope is every active account
 not linked to the current organisation (all of them for ``change``; for ``first``, Phase 2's own
 accounts). Finish relinks only what changed, may swap two accounts' Xero accounts, clears the marker,
-and resets ``xero_publish_from`` to today for ``first``/``new_org`` (older records stay with the old
-organisation) but keeps it for ``new_accounts``/``change`` (only what is published from then on).
+and resets ``xero_publish_from`` to today for ``first``/``new_org`` but keeps it for
+``new_accounts``/``change``.
 While a matching is open the sync refreshes only the Xero copies (``sync.sync_company``).
 """
 
@@ -656,7 +656,7 @@ def finish(entity_id, user_id) -> dict:
         AccountMatchDraft.objects.filter(entity_id=entity_id).delete()
         done = {"setup_mode": "xero", "xero_matching": None}
         if reason in ("first", "new_org", None):
-            # only records from today go to this organisation; older ones stay with the old one
+            # the day Finish ran (no longer a publish cut-off - owner, 2026-11-18)
             done["xero_publish_from"] = datetime.now(HK).date()
         Entity.objects.filter(id=entity_id).update(**done)
     logger.info("xero matching: company %s finished: %s linked, %s combined, %s archived (batch %s)", entity_id,

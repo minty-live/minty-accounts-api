@@ -450,7 +450,7 @@ pointing at nothing.
   survivor's, carrying the default - as `uq_ebax_entity_xero_account` allows one per Xero account;
   two of them failed every Finish until 2026-11-13); unused unmatched accounts archived (never deleted); all
   logged in `account_change_log` (one batch); drafts deleted; `setup_mode = 'xero'` and
-  `xero_publish_from` = today (Hong Kong; owner: only records from then on go to Xero).
+  `xero_publish_from` = today (Hong Kong; the day Finish ran, no longer a publish cut-off: owner 2026-11-18, any record publishes once Xero is connected).
 - **Suppliers** (after the replace commits): each own supplier linked to the Xero contact of its name
   (case and surrounding spaces ignored; the active one first, else the first by Xero id - the doc's Q9
   default), else created in Xero under its Minty name; one already stored here is merged into it.
@@ -471,8 +471,8 @@ pointing at nothing.
   prefills a pick per account; `POST .../matching/cancel` leaves it, nothing changed; the company stays
   connected and publishing goes on. Finish relinks only what changed (two accounts may swap: the
   changed ones let go of their Xero id first, as `uq_account_entity_xero` isn't deferrable), clears
-  the marker, resets `xero_publish_from` to today for `first`/`new_org` (older records stay with the
-  old organisation) and keeps it for `new_accounts`/`change` (only what is published from then on);
+  the marker, resets `xero_publish_from` to today for `first`/`new_org` and keeps it for
+  `new_accounts`/`change` (a record of when Finish ran, no longer a publish cut-off);
   a change's Finish skips the suppliers step (nothing created in Xero). Suppliers of another
   organisation are linked by `link_suppliers` after a new organisation's Finish. While any matching is
   open the sync refreshes only the copies. Tests: `hub/tests/test_xero_matching.py`,
