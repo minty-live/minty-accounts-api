@@ -180,14 +180,14 @@ def _send_code_email(email: str, code: str) -> bool:
 
 def _code_email_html(code: str) -> str:
     return f"""\
-<!DOCTYPE html><html><body style="margin:0;padding:40px 0;font-family:Arial,Helvetica,sans-serif;background:#f0f4f8;">
+<!DOCTYPE html><html><body style="margin:0;padding:40px 0;font-family:Arial,Helvetica,sans-serif;background:#f5f7fa;">
   <table width="100%" cellpadding="0" cellspacing="0"><tr><td align="center">
     <table width="460" cellpadding="0" cellspacing="0" style="background:#fff;border-radius:16px;padding:36px 40px;box-shadow:0 4px 24px rgba(0,0,0,.08);">
       <tr><td style="text-align:center;">
-        <h1 style="color:#2d3748;font-size:20px;margin:0 0 8px;">Your sign-in code</h1>
-        <p style="color:#718096;font-size:14px;margin:0 0 24px;">Enter this code to continue to Minty.</p>
-        <div style="font-size:34px;font-weight:700;letter-spacing:8px;color:#3BB8BF;">{code}</div>
-        <p style="color:#a0aec0;font-size:12px;margin:24px 0 0;">This code expires in {OTP_EXPIRY_SECONDS} seconds. If you didn't request it, you can ignore this email.</p>
+        <h1 style="color:#16202e;font-size:20px;margin:0 0 8px;">Your sign-in code</h1>
+        <p style="color:#6b7380;font-size:14px;margin:0 0 24px;">Enter this code to continue to Minty.</p>
+        <div style="font-size:34px;font-weight:700;letter-spacing:8px;color:#2e9b9b;">{code}</div>
+        <p style="color:#8b93a0;font-size:12px;margin:24px 0 0;">This code expires in {OTP_EXPIRY_SECONDS} seconds. If you didn't request it, you can ignore this email.</p>
       </td></tr>
     </table>
   </td></tr></table>

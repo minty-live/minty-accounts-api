@@ -272,12 +272,12 @@ def _build_invitation_html(
   }}
 </style>
 </head>
-<body style="margin:0;padding:0;font-family:'Inter',Arial,Helvetica,sans-serif;background:#f0f4f8;">
-  <div style="display:none;font-size:1px;color:#f0f4f8;line-height:1px;max-height:0;max-width:0;opacity:0;overflow:hidden;">
+<body style="margin:0;padding:0;font-family:'Inter',Arial,Helvetica,sans-serif;background:#f5f7fa;">
+  <div style="display:none;font-size:1px;color:#f5f7fa;line-height:1px;max-height:0;max-width:0;opacity:0;overflow:hidden;">
     {inviter_name} invited you to join {entity_name} on Minty.
   </div>
   <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"
-         style="background:#f0f4f8;">
+         style="background:#f5f7fa;">
     <tr><td align="center" class="m-wrap" style="padding:40px 12px;">
 
       <!--[if mso]>
@@ -297,26 +297,26 @@ def _build_invitation_html(
 
         <!-- Body -->
         <tr><td class="m-pad m-body" style="padding:36px 40px 0 40px;">
-          <h1 class="m-h1" style="color:#2d3748;font-size:22px;margin:0 0 8px 0;text-align:center;">
+          <h1 class="m-h1" style="color:#16202e;font-size:22px;margin:0 0 8px 0;text-align:center;">
             You&#39;ve Been Invited!
           </h1>
-          <p style="color:#718096;font-size:14px;text-align:center;margin:0 0 28px 0;">
+          <p style="color:#6b7380;font-size:14px;text-align:center;margin:0 0 28px 0;">
             Join your team on Minty and start collaborating.
           </p>
         </td></tr>
 
         <tr><td class="m-pad" style="padding:0 40px;">
           <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"
-                 style="background:#f7fafc;border-radius:10px;">
-            <tr><td style="padding:20px 24px;color:#4a5568;font-size:14px;line-height:1.7;
+                 style="background:#f5f7fa;border-radius:10px;">
+            <tr><td style="padding:20px 24px;color:#6b7380;font-size:14px;line-height:1.7;
                            word-break:break-word;">
               <p style="margin:0 0 6px 0;">
                 <strong>{inviter_name}</strong> has invited you to join
               </p>
               <p style="margin:0 0 6px 0;font-size:18px;">
-                <strong style="color:#54D3DA;">{entity_name}</strong>
+                <strong style="color:#2e9b9b;">{entity_name}</strong>
               </p>
-              <p style="margin:0;color:#718096;">
+              <p style="margin:0;color:#6b7380;">
                 Role: <strong>{role_display}</strong>
               </p>
             </td></tr>
@@ -326,10 +326,10 @@ def _build_invitation_html(
         <!-- CTA Button -->
         <tr><td class="m-cta" style="text-align:center;padding:32px 40px;">
           <a href="{accept_url}" class="m-btn"
-             style="display:inline-block;background:#54D3DA;color:#ffffff;text-decoration:none;
+             style="display:inline-block;background:#4fc7c7;color:#ffffff;text-decoration:none;
                     padding:14px 48px;border-radius:8px;font-weight:600;font-size:16px;
                     line-height:1.2;text-align:center;
-                    box-shadow:0 2px 8px rgba(84,211,218,0.35);">
+                    box-shadow:0 2px 8px rgba(79,199,199,0.35);">
             Accept Invitation
           </a>
         </td></tr>
@@ -337,7 +337,7 @@ def _build_invitation_html(
         <!-- The link as plain text: a mail service's click tracker rewrites only <a> links, so this
              one still reaches Minty when the tracker is down -->
         <tr><td class="m-pad" style="padding:0 40px 24px 40px;text-align:center;">
-          <p style="color:#718096;font-size:12px;line-height:1.5;margin:0;word-break:break-all;">
+          <p style="color:#6b7380;font-size:12px;line-height:1.5;margin:0;word-break:break-all;">
             If the button doesn&#39;t open, copy this link into your browser:<br />
             {accept_url}
           </p>
@@ -345,8 +345,8 @@ def _build_invitation_html(
 
         <!-- Footer -->
         <tr><td class="m-pad"
-                style="padding:16px 40px 24px 40px;text-align:center;border-top:1px solid #e2e8f0;">
-          <p style="color:#a0aec0;font-size:12px;line-height:1.5;margin:0;">
+                style="padding:16px 40px 24px 40px;text-align:center;border-top:1px solid #eef1f4;">
+          <p style="color:#8b93a0;font-size:12px;line-height:1.5;margin:0;">
             If you did not expect this invitation you can safely ignore this email.<br />
             &copy; {_current_year()} Daily Minty Limited
           </p>

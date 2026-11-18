@@ -234,7 +234,10 @@ keeps only the membership reads. The payer, pending-handover and only-admin guar
     expired one is marked `expired` and replaced.
   - A resend gets a new token, so the old link dies. It waits 60 s after the last send (429 with
     `retry_after`; the count is per worker, as in Flask), and a send that fails is a 502.
-  - The email is Flask's HTML, sent from `INVITE_FROM`. Its accept link is
+  - The email is Flask's HTML, sent from `INVITE_FROM`. Its colours, and the sign-in code
+    mail's, are the Minty tokens (owner, 2026-11-18): button #4FC7C7, the company
+    name and the code link teal #2E9B9B, text #16202E/#6B7380/#8B93A0 - never Brand #54D3DA as a
+    fill (`hub/tests/test_mail_colours.py`). Its accept link is
     `{ACCOUNTS_API_URL}/invitation/accept/<token>?fn=&ln=`, which stays Flask's page until Phase 6.
     The link is on the button and again as plain text under it ("If the button doesn't open, copy
     this link into your browser:"). Brevo's click tracking rewrites only the button's link, and its
