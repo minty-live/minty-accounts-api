@@ -3,6 +3,7 @@ grants and use, and give a company a grant - a top-up, or a size other than the 
 
     GET  /api/me/ai/companies[?q=&page=|?ids=]  the companies, each with what is left of its grants
     GET  /api/me/ai/companies/<id>            one company: its grants, its last reads
+    GET  /api/me/ai/companies/<id>/reads?before=<read id>  the next older reads ("Show more")
     POST /api/me/ai/companies/<id>/grants     {tokens?, reads?, days?, note?} -> the company again
 
 The allowance itself is minty-db's ``ai_policy``/``ai_grant``/``ai_read`` through
@@ -19,7 +20,7 @@ import logging
 import uuid
 from datetime import UTC, datetime
 
-from django.db.models import Count, Max, Q
+from django.db.models import Count, Max, Q, Subquery
 from django.http import HttpRequest, HttpResponse
 from django.utils import timezone
 from minty_db.models import AiGrant, AiRead, Entity
@@ -40,6 +41,8 @@ MAX_NOTE = 255
 
 ONLY_SUPPORT = "Only Minty support can manage AI allowances."
 NOT_FOUND = "I couldn't find that company."
+READ_NOT_FOUND = "I couldn't find that read. Close the company and open it again."
+READS_PAGE = 20
 NO_POLICY = ("The AI settings are missing or can't be used, so AI reading is off. "
              "Check ai_policy with manage.py ai_policy.")
 REFUSED = "The grant wasn't given. Fix the fields below and try again."
@@ -168,12 +171,7 @@ def _detail(entity: Entity, policy: ai_allowance.Policy) -> dict:
             "note": g.note,
             "created_at": _iso(g.created_at),
         })
-    reads = [
-        {"created_at": _iso(r.created_at), "module": r.module, "status": r.status,
-         "model": r.model_answered, "attempts": r.attempts,
-         "tokens": r.tokens_in + r.tokens_out + r.tokens_thought}
-        for r in AiRead.objects.filter(entity_id=entity.id).order_by("-created_at", "-id")[:20]
-    ]
+    reads, more = _reads(entity.id)
     spec = policy.default_grant
     return {
         "company": {"id": str(entity.id), "name": entity.name},
@@ -181,12 +179,32 @@ def _detail(entity: Entity, policy: ai_allowance.Policy) -> dict:
         "default_grant": None if spec is None else {"tokens": spec.tokens, "reads": spec.reads, "days": spec.days},
         "grants": grants,
         "reads": reads,
+        "reads_more": more,
     }
+
+
+def _reads(entity_id, before: AiRead | None = None) -> tuple[list[dict], bool]:
+    """``READS_PAGE`` reads newest first, older than ``before`` when given, and whether any older
+    ones are left (owner, 2026-11-19: "Show more", not a fixed 20). The cursor is (created_at, id):
+    reads can share a created_at, and the order breaks the tie on the id."""
+    rows = AiRead.objects.filter(entity_id=entity_id)
+    if before is not None:
+        # compared in the database: the cursor's created_at never round-trips through Python
+        at = Subquery(AiRead.objects.filter(id=before.id).values("created_at")[:1])
+        rows = rows.filter(Q(created_at__lt=at) | Q(created_at=at, id__lt=before.id))
+    page = list(rows.order_by("-created_at", "-id")[:READS_PAGE + 1])
+    return [
+        {"id": str(r.id), "created_at": _iso(r.created_at), "module": r.module, "status": r.status,
+         "model": r.model_answered, "attempts": r.attempts,
+         "tokens": r.tokens_in + r.tokens_out + r.tokens_thought}
+        for r in page[:READS_PAGE]
+    ], len(page) > READS_PAGE
 
 
 def ai_company(request: HttpRequest, entity_id: str) -> HttpResponse:
     """``GET /api/me/ai/companies/<id>``: one company's allowance (its grants and the extra caps),
-    every grant it was given (newest first, with what was charged to it) and its last 20 reads."""
+    every grant it was given (newest first, with what was charged to it), its last 20 reads and
+    ``reads_more`` when older ones are left."""
     early, _user = _superuser(request, ("GET",))
     if early is not None:
         return early
@@ -197,6 +215,25 @@ def ai_company(request: HttpRequest, entity_id: str) -> HttpResponse:
     if policy is None:
         return refuse(request, NO_POLICY, 503)
     return respond(request, _detail(entity, policy))
+
+
+def ai_company_reads(request: HttpRequest, entity_id: str) -> HttpResponse:
+    """``GET /api/me/ai/companies/<id>/reads?before=<read id>``: the next ``READS_PAGE`` reads
+    older than that one (a read of THIS company), ``{reads, more}``."""
+    early, _user = _superuser(request, ("GET",))
+    if early is not None:
+        return early
+    entity = _company(entity_id)
+    if entity is None:
+        return refuse(request, NOT_FOUND, 404)
+    try:
+        before = AiRead.objects.filter(id=uuid.UUID(request.GET.get("before", "")), entity_id=entity.id).first()
+    except ValueError:
+        before = None
+    if before is None:
+        return refuse(request, READ_NOT_FOUND, 404)
+    reads, more = _reads(entity.id, before)
+    return respond(request, {"reads": reads, "more": more})
 
 
 # --------------------------------------------------------------------------- giving a grant

@@ -126,6 +126,47 @@ def test_a_company_shows_its_grants_newest_first_and_its_reads(shop, policy):
                                                                                 "gemini-3.8-flash")
 
 
+def reads_after(entity_id, before):
+    return f"/api/me/ai/companies/{entity_id}/reads?before={before}"
+
+
+def test_its_reads_come_twenty_at_a_time_and_show_more_reaches_the_older_ones(shop, policy):
+    # owner, 2026-11-19: "Show more" instead of a fixed 20. Reads can share a created_at, so the id
+    # breaks the tie - the cursor holds both.
+    for _ in range(25):
+        read(shop["entity"], tokens=100)
+    boss = superuser()
+
+    body = call("get", detail(shop["entity"].id), boss).json()
+    assert len(body["reads"]) == 20 and body["reads_more"] is True
+    first_page = [r["id"] for r in body["reads"]]
+
+    more = call("get", reads_after(shop["entity"].id, first_page[-1]), boss).json()
+    assert len(more["reads"]) == 5 and more["more"] is False
+    rest = [r["id"] for r in more["reads"]]
+    expected = [str(r.id) for r in AiRead.objects.filter(entity_id=shop["entity"].id).order_by("-created_at", "-id")]
+    assert first_page + rest == expected
+
+
+def test_a_short_history_says_there_is_nothing_more(shop, policy):
+    read(shop["entity"])
+    body = call("get", detail(shop["entity"].id), superuser()).json()
+    assert len(body["reads"]) == 1 and body["reads_more"] is False
+
+
+@pytest.mark.parametrize("before", ["not-a-read", "6d8f2c9a-0000-4000-8000-000000000000", "other"])
+def test_show_more_only_follows_a_read_of_that_company(shop, policy, before):
+    if before == "other":
+        before = str(read(shop["other"]).id)
+    assert call("get", reads_after(shop["entity"].id, before), superuser()).status_code == 404
+
+
+@pytest.mark.parametrize("who", ["admin", "accountant", "cashier"])
+def test_only_a_superuser_sees_more_reads(shop, policy, who):
+    mine = read(shop["entity"])
+    assert call("get", reads_after(shop["entity"].id, mine.id), shop[who]).status_code == 403
+
+
 def test_an_unknown_company_is_not_found(shop, policy):
     boss = superuser()
     assert call("get", detail("not-a-company"), boss).status_code == 404
