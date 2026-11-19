@@ -5,6 +5,7 @@ from django.urls import path
 
 import hub.addresses  # noqa: F401 - registers the <entity:...> converter
 from hub import (
+    ai_grants,
     company,
     company_chart,
     contact,
@@ -44,6 +45,10 @@ urlpatterns = [
     path("api/me/entities", entities.my_entities, name="my_entities"),
     path("api/me/entities/<str:entity_id>/archive", entities.archive_entity, name="archive_entity"),
     path("api/me/entities/<str:entity_id>/restore", entities.restore_entity, name="restore_entity"),
+    # AI allowances for Minty support (owner, 2026-11-18): superusers only
+    path("api/me/ai/companies", ai_grants.ai_companies, name="ai_companies"),
+    path("api/me/ai/companies/<str:entity_id>", ai_grants.ai_company, name="ai_company"),
+    path("api/me/ai/companies/<str:entity_id>/grants", ai_grants.ai_company_grants, name="ai_company_grants"),
     path("api/me/profile", profile.my_profile, name="my_profile"),
     path("api/me/terms", terms.terms_status, name="terms_status"),
     path("api/me/terms/accept", terms.terms_accept, name="terms_accept"),
