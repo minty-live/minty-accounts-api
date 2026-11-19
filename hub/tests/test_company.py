@@ -456,11 +456,17 @@ def test_a_resend_whose_email_fails_is_a_502(shop, monkeypatch):
     assert resp.status_code == 502 and "retry_after" in resp.json()
 
 
-def test_the_view_all_account_is_promoted_when_invited(shop):
+def test_no_address_is_made_a_superuser_by_an_invitation(shop):
+    """Owner, 2026-11-19: the view-all auto-promotion is removed - an invitation never changes a
+    system role, whoever it names (viewall@ joins as the role it was invited with, nothing more)."""
     viewall = make_user("viewall@dailyminty.com", approved=False)
     assert invite(shop["admin"], shop["entity"], email="viewall@dailyminty.com").status_code == 201
     viewall.refresh_from_db()
-    assert (str(viewall.system_role), viewall.approved) == ("superadmin", True)
+    assert (str(viewall.system_role), viewall.approved) == ("normal", False)
+    entity_id, refusal = invitations.accept_invitation(Invitation.objects.get().token, viewall.id)
+    assert (entity_id, refusal) == (str(shop["entity"].id), None)
+    viewall.refresh_from_db()
+    assert (str(viewall.system_role), viewall.approved) == ("normal", True)
 
 
 # ---- Entity & Integration ---------------------------------------------------------------------

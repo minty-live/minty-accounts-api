@@ -5,8 +5,8 @@ onboarding's invite step both use these (subscription-api's "invite an admin" re
 - An invitation holds a secret token (the accept link), the names the account is made from at
   sign-in, and an expiry ``INVITATION_TTL_DAYS`` ahead. An already-approved member, or an unexpired
   pending invitation for the same address, is refused (an expired one is marked so, and a new one
-  goes ahead). The always-superuser view-all accounts (``AUTO_SUPERUSER_EMAILS``) are promoted
-  when they already exist.
+  goes ahead). An invitation never changes a system role (owner, 2026-11-19: Flask's
+  ``AUTO_SUPERUSER_EMAILS`` view-all promotion is removed).
 - Resend rotates the token (the old link dies) and resets the expiry, no sooner than
   ``RESEND_COOLDOWN_SECONDS`` after the last send. The cooldown is in process memory, per worker,
   as Flask's: best effort, never a security property.
@@ -37,9 +37,6 @@ logger = logging.getLogger("minty-accounts-api")
 
 INVITATION_TTL_DAYS = int(os.environ.get("INVITATION_TTL_DAYS", 7))
 RESEND_COOLDOWN_SECONDS = int(os.environ.get("INVITATION_RESEND_COOLDOWN_SECONDS", 60))
-AUTO_SUPERUSER_EMAILS = frozenset(
-    e.strip().lower() for e in os.environ.get("AUTO_SUPERUSER_EMAILS", "viewall@dailyminty.com").split(",") if e.strip()
-)
 LOGO = Path(settings.BASE_DIR) / "static" / "img" / "new_logo.png"
 
 _LAST_SENT: dict[str, datetime] = {}
@@ -78,10 +75,6 @@ def create_invitation(entity_id, email: str, role: str, invited_by, first_name: 
     if not Entity.objects.filter(id=entity_id, archived_at__isnull=True).exists():
         return None, "Entity not found."
     existing = User.objects.filter(email=email).first() or User.objects.filter(username=email).first()
-    if existing is not None and email.strip().lower() in AUTO_SUPERUSER_EMAILS:
-        if existing.system_role != "superadmin" or not existing.approved:
-            existing.system_role, existing.approved = "superadmin", True
-            existing.save(update_fields=["system_role", "approved"])
     if existing is not None and UserEntity.objects.filter(user_id=existing.id, entity_id=entity_id,
                                                           approved=True).exists():
         return None, "This user is already a member of this entity."
@@ -133,9 +126,6 @@ def accept_invitation(token: str, user_id) -> tuple[str | None, str | None]:
     if invitation.email.lower() not in owned:
         logger.warning("invitation.accept.email_mismatch invitation=%s user=%s", invitation.id, user_id)
         return None, "This invite went to a different account — mind signing in as that one?"
-    if invitation.email.strip().lower() in AUTO_SUPERUSER_EMAILS and (
-            user.system_role != "superadmin" or not user.approved):
-        User.objects.filter(id=user.id).update(system_role="superadmin", approved=True)
     if str(invitation.status) == "accepted":
         if UserEntity.objects.filter(user_id=user.id, entity_id=invitation.entity_id).exists():
             return str(invitation.entity_id), None

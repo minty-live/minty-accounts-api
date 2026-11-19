@@ -232,6 +232,9 @@ keeps only the membership reads. The payer, pending-handover and only-admin guar
     the four assignable roles.
   - A current member, or an unexpired pending invitation for the same address, is a 409. An
     expired one is marked `expired` and replaced.
+  - An invitation never changes a system role (owner, 2026-11-19). Flask's `AUTO_SUPERUSER_EMAILS`,
+    which made `viewall@dailyminty.com` a superuser when invited, is gone; a superuser is set only
+    in the database (`mintyliveadmin@` by the data load).
   - A resend gets a new token, so the old link dies. It waits 60 s after the last send (429 with
     `retry_after`; the count is per worker, as in Flask), and a send that fails is a 502.
   - The email is Flask's HTML, sent from `INVITE_FROM`. Its colours, and the sign-in code
