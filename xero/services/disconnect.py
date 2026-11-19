@@ -99,8 +99,22 @@ def _disconnect(entity_id, *, status: str, keep_org: bool) -> None:
 
 
 def disconnect_entity_from_xero(entity_id) -> None:
-    """The one disconnect: the company ends ``disconnected``, keeping its organisation and its copy."""
-    _disconnect(entity_id, status="disconnected", keep_org=True)
+    """The one disconnect: the company ends ``disconnected``, keeping its organisation and its copy.
+
+    Also while a matching is open (the user, 2026-11-19: "there should still be a disconnect"): the
+    matching is closed and its unsaved picks dropped. A company that never finished its FIRST matching
+    (``setup_mode`` still ``minty``) was never connected, so the organisation goes too - it keeps its
+    books in Minty, as before it signed in to Xero."""
+    from minty_db.models import AccountMatchDraft
+
+    entity = Entity.objects.filter(id=entity_id).values("setup_mode", "xero_matching").first()
+    first_unfinished = bool(entity) and entity["setup_mode"] == "minty"
+    _disconnect(entity_id, status="disconnected", keep_org=not first_unfinished)
+    if entity and entity["xero_matching"]:
+        with transaction.atomic():
+            AccountMatchDraft.objects.filter(entity_id=entity_id).delete()
+            Entity.objects.filter(id=entity_id).update(xero_matching=None)
+        logger.info("Entity %s: the open matching (%s) closed by the disconnect", entity_id, entity["xero_matching"])
 
 
 def disconnect_onboarding_entity(entity_id) -> None:

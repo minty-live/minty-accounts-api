@@ -67,9 +67,12 @@ MINTY_LOGGABLE_PATH = "core.hardening.loggable_path"
 # old Flask cookie is replaced rather than left beside it (everyone signs in again once); its
 # lifetime and flags. No CSRF middleware: the JSON calls come cross-origin with no cookie, and the
 # few cookie POSTs (sign out, leave a company) check the Origin themselves (hub/session.py).
-SESSION_ENGINE = "django.contrib.sessions.backends.db"
+# Phase 9 (owner's S1, 2026-11-19): signed out after 60 minutes WITHOUT ACTIVITY - the row's
+# expiry, pushed on by the front door and by every app's API through the session touch
+# (hub/session_store.py, whose store also keys a session by its sign-in's sid).
+SESSION_ENGINE = "hub.session_store"
 SESSION_COOKIE_NAME = "session"
-SESSION_COOKIE_AGE = 24 * 60 * 60
+SESSION_COOKIE_AGE = 60 * 60
 SESSION_COOKIE_HTTPONLY = True
 SESSION_COOKIE_SAMESITE = "Lax"
 SESSION_COOKIE_SECURE = not DEVELOPMENT

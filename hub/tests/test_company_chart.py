@@ -102,3 +102,61 @@ def test_onboarding_unreachable_or_unset_is_said_and_logged(shop, onboarding, se
     resp = call("get", CONTACTS, shop["admin"], shop["entity"].id)
     assert resp.status_code == 503
     assert "ONBOARDING_API_URL is not set" in caplog.text
+
+
+# ---- opening General reads Xero's contacts (owner's decisions doc C2, 2026-11-19) ------------------
+
+
+@pytest.fixture
+def xero_read(monkeypatch):
+    """The sync faked: each read stamps a Xero copy, as the real one does (``synced_at``)."""
+    from django.utils import timezone
+    from minty_db.models import XeroContact
+
+    reads = []
+
+    def fake_sync(entity_id, access_token, org):
+        reads.append((entity_id, access_token, org))
+        XeroContact.objects.update_or_create(entity_id=entity_id, xero_org_id=org, xero_guid="c-1",
+                                             defaults={"name": "ABC", "synced_at": timezone.now()})
+        return {"accounts": None, "contacts": {"added": 0}}
+
+    monkeypatch.setattr(company_chart.xero_sync, "sync_company", fake_sync)
+    monkeypatch.setattr(company_chart, "resolve_entity_access_token", lambda entity_id: ("tok", "org-1"))
+    return reads
+
+
+def test_the_contact_list_reads_xero_first_at_most_every_two_minutes(shop, onboarding, xero_read):
+    from minty_db.models import Entity
+
+    entity = shop["entity"]
+    Entity.objects.filter(id=entity.id).update(status="connected", xero_org_id="org-1")
+    onboarding.answer = (200, {"contacts": []})
+    assert call("get", CONTACTS, shop["cashier"], entity.id).status_code == 200
+    assert call("get", CONTACTS, shop["cashier"], entity.id).status_code == 200
+    assert len(xero_read) == 1, "once every 2 minutes"
+    call("get", ACCOUNTS, shop["cashier"], entity.id)
+    assert len(xero_read) == 1, "the accounts list doesn't read Xero"
+
+
+def test_a_company_not_connected_never_reads_xero(shop, onboarding, xero_read):
+    onboarding.answer = (200, {"contacts": []})
+    assert call("get", CONTACTS, shop["cashier"], shop["entity"].id).status_code == 200
+    assert xero_read == []
+
+
+def test_xero_failing_still_shows_the_stored_contacts_and_is_logged(shop, onboarding, monkeypatch, caplog):
+    from minty_db.models import Entity
+
+    entity = shop["entity"]
+    Entity.objects.filter(id=entity.id).update(status="connected", xero_org_id="org-1")
+    monkeypatch.setattr(company_chart, "resolve_entity_access_token", lambda entity_id: ("tok", "org-1"))
+
+    def broken(*_a):
+        raise RuntimeError("xero down")
+
+    monkeypatch.setattr(company_chart.xero_sync, "sync_company", broken)
+    onboarding.answer = (200, {"contacts": [{"name": "Kee Wah"}]})
+    resp = call("get", CONTACTS, shop["cashier"], entity.id)
+    assert (resp.status_code, resp.json()) == (200, {"contacts": [{"name": "Kee Wah"}]})
+    assert "the Xero read for company" in caplog.text

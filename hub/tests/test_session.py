@@ -143,6 +143,7 @@ def test_a_secret_path_is_not_cached_and_never_logged():
     assert loggable_path("/api/me/entities") == "/api/me/entities"
 
 
-def test_the_session_cookie_keeps_flasks_name_lifetime_and_flags():
+def test_the_session_cookie_keeps_flasks_name_and_flags_and_ends_after_an_idle_hour():
+    # Flask's 24 h became 60 minutes without activity (Phase 9, owner's S1, 2026-11-19).
     assert (settings.SESSION_COOKIE_NAME, settings.SESSION_COOKIE_AGE, settings.SESSION_COOKIE_HTTPONLY,
-            settings.SESSION_COOKIE_SAMESITE) == ("session", 86400, True, "Lax")
+            settings.SESSION_COOKIE_SAMESITE) == ("session", 3600, True, "Lax")

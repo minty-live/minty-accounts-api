@@ -152,3 +152,37 @@ def company_xero_matching_change(request: HttpRequest) -> HttpResponse:
 
 def company_xero_matching_cancel(request: HttpRequest) -> HttpResponse:
     return _change_route(request, matching.cancel_change)
+
+
+def company_xero_matching_account(request: HttpRequest) -> HttpResponse:
+    """One account mapped again (the owner's decisions doc A3, 2026-11-19): ``GET ?account=<id>`` -
+    the account as a matching row and the Xero accounts to pick from; ``POST {account_id,
+    xero_account_id}`` - linked to it (``matching.map_one``). A Xero account another active account
+    holds: 409 with ``merge_into`` (the user's rule: merge instead)."""
+    if request.method == "POST":
+        early, user, entity_id = _open(request, Permission.XERO_SETTINGS_UPDATE, NO_EDIT)
+        if early is not None:
+            return early
+        data = _body(request)
+        account_id, copy_id = _uuid(data.get("account_id")), _uuid(data.get("xero_account_id"))
+        if account_id is None or copy_id is None:
+            return refuse(request, matching.NOT_A_XERO_ACCOUNT, 400)
+        try:
+            return respond(request, matching.map_one(Entity.objects.get(id=entity_id), account_id, copy_id, user.id))
+        except matching.Taken as taken:
+            return respond(request, {"error": taken.message,
+                                     "merge_into": {"id": str(taken.holder.id), "name": taken.holder.name}}, 409)
+        except matching.Refused as refusal:
+            return refuse(request, refusal.message, refusal.status)
+    if request.method not in ("GET", "OPTIONS"):
+        return refuse(request, "Method not allowed", 405)
+    early, user, entity_id = _open(request, Permission.XERO_SETTINGS_VIEW, NO_VIEW)
+    if early is not None:
+        return early
+    account_id = _uuid(request.GET.get("account"))
+    if account_id is None:
+        return refuse(request, matching.NOT_OWN, 404)
+    try:
+        return respond(request, matching.read_one(Entity.objects.get(id=entity_id), account_id))
+    except matching.Refused as refusal:
+        return refuse(request, refusal.message, refusal.status)

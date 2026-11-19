@@ -6,6 +6,12 @@ the Flask retirement, 2026-11-06).
   skew), with NO scope check. A module token and an onboarding token both pass, as in Flask. Its
   ``entity_id`` claim is ignored: a company travels as ``?entity=`` and is checked against
   membership by each route.
+- **The sign-in** behind the token (its ``sid``, Phase 9) must not have ended - signed out, or 60
+  minutes without activity; each call keeps it alive (``hub/session_store.touch``, at most once a
+  minute per sid). A token with no ``sid`` (minted before Phase 9) passes until it expires. When
+  the sign-in has ended - the token still valid or run out too - the 401 adds ``"reason":
+  "session_expired"`` (owner, 2026-11-19): the app says the session has expired and sends the
+  person to sign in, instead of renewing quietly.
 - **The person** must exist and be ``approved``; otherwise 401 ``{"error": "unauthorized"}``, which
   minty-web answers by fetching a fresh token.
 - **CORS:** the request's ``Origin`` is echoed when it is one of the three front ends, an
@@ -30,6 +36,7 @@ from minty_db.models import User
 from minty_shared import logctx, tokens
 
 from core.flask_json import flask_json
+from hub import session_store
 
 #: Everything the hub's routes answer between them (a preflight for any other is refused).
 METHODS = "GET, POST, PATCH, DELETE, OPTIONS"
@@ -108,9 +115,23 @@ def bearer_claims(request: HttpRequest) -> dict | None:
     header = request.headers.get("Authorization", "")
     if not header.startswith("Bearer "):
         return None
+    raw = header[len("Bearer "):].strip()
     try:
-        claims = tokens.decode_bearer(header[len("Bearer "):].strip(), settings.SECRET_KEY)
+        claims = tokens.decode_bearer(raw, settings.SECRET_KEY)
+    except jwt.ExpiredSignatureError:
+        # Ran out AND its sign-in has ended (the usual case after 60 idle minutes): the 401 says
+        # so (``unauthorized_reason``), and the app shows "Your session has expired".
+        if tokens.session_ended(raw, "", settings.SECRET_KEY, touch=session_store.touch):
+            tokens.mark_session_ended(request)
+        return None
     except jwt.PyJWTError:
+        return None
+    # The sign-in behind the token (Phase 9): ended = no token; alive = kept alive (this call is
+    # activity). Here directly, at most once a minute per sid; a token with no sid lives until it
+    # expires.
+    if not tokens.SESSIONS.alive(claims.get("sid"), session_store.touch):
+        logger.info("hub bearer refused: its sign-in has ended")
+        tokens.mark_session_ended(request)
         return None
     logctx.bind(user=claims.get("user_id"))
     return claims
@@ -129,7 +150,7 @@ def guard(request: HttpRequest) -> tuple[HttpResponse | None, User | None]:
     user_id = bearer_user_id(request)
     user = User.objects.filter(id=user_id).first() if user_id and _is_uuid(user_id) else None
     if user is None or not user.approved:
-        return refuse(request, "unauthorized", 401), None
+        return respond(request, {"error": "unauthorized", **tokens.unauthorized_reason(request)}, 401), None
     return None, user
 
 

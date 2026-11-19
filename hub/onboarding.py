@@ -28,6 +28,7 @@ from datetime import UTC, datetime
 from django.conf import settings
 from django.http import HttpRequest, HttpResponse
 from minty_db.models import Entity, EntityFunction, EntityFunctionMap, Invitation, User, UserEntity
+from minty_shared import tokens
 
 from core.flask_json import flask_json
 from hub import invitations
@@ -61,7 +62,7 @@ def _door(request: HttpRequest, methods: tuple[str, ...]):
         return _respond(request, {"error": "Method not allowed"}, 405), None
     user_id = bearer_user_id(request)
     if not user_id:
-        return _respond(request, {"error": "Unauthorized"}, 401), None
+        return _respond(request, {"error": "Unauthorized", **tokens.unauthorized_reason(request)}, 401), None
     return None, user_id
 
 

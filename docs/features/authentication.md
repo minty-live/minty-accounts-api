@@ -124,19 +124,22 @@ Every typed email address is printable ASCII (0x21-0x7E) and nothing else (2026-
 
 `hub/session.py` and `config/settings.py`. Django's sessions (`django.contrib.sessions`, database
 backend, table `django_session` - made by hand with `manage.py migrate sessions` on each database,
-not in the schema file), lifetime **24 hours**, cookie `session` (Flask's name, so Flask's old
-cookie was replaced and everyone signed in again once), `HttpOnly`, `SameSite=Lax`, `Secure`
-everywhere but development. There is no `django.contrib.auth`: the session holds the person's id
-and the sign-in's id (`login_sid`, the module tokens' `sid` claim), plus flashed messages, the
-preview set, the Terms answer and the Xero nonce. Flask's `sessions` table is no longer used.
+not in the schema file; engine `hub.session_store`, Django's database store with a key bound to the
+sign-in), cookie `session` (Flask's name, so Flask's old cookie was replaced and everyone signed in
+again once), `HttpOnly`, `SameSite=Lax`, `Secure` everywhere but development. There is no
+`django.contrib.auth`: the session holds the person's id and the sign-in's id (`login_sid`, every
+hand-off token's `sid` claim), plus flashed messages, the preview set, the Terms answer and the
+Xero nonce. Flask's `sessions` table is no longer used.
 
-- `sign_in` cycles the session key (no fixation), starts a fresh `login_sid` and stamps presence.
+- `sign_in` gives the session a new key (no fixation) derived from a fresh `login_sid`, and stamps
+  presence.
 - `signed_in_user`: a cookie naming a person who is gone or not approved is emptied.
 - **No CSRF middleware.** The JSON routes are called cross-origin with a bearer token and no
   cookie. The two cookie POSTs, `/logout` and `/leave-entity` (`hub/handoffs.py`), must come from
   one of the front ends (`Origin`: the configured four, this service's own, `EXTRA_FRONTEND_ORIGINS`
   or a preview-set host; else 403) - on top of SameSite=Lax.
-- There is **no idle logout**; what "still here" means is section 8.
+- **Signed out after 60 minutes without activity** (Phase 9, owner's S1-S3, 2026-11-19; it was
+  24 hours from the last save) - section 3.3. Presence ("still here") is section 8.
 - `POST /logout` drops what was flashed, stamps `signed_in_at = NULL`, empties the session and
   goes to `/`. `POST /leave-entity` takes the person off the presence list, keeps the session and
   goes to `/entity`. A GET to either is 405.
@@ -220,6 +223,75 @@ The short id decides; the name is only for reading (`hub/addresses.py`):
   minty-petty-cash-web's `/share/<path>`. Any path not routed is a 404 (no fall-through to Flask
   since 2026-11-06). The JSON APIs, OAuth, `/profile` and `/handoff/*` keep the uuid.
 
+### 3.3 Sign-out after 60 minutes without activity (Phase 9, 2026-11-19)
+
+The owner's rules: **S1** Minty, Petty Cash, Payment Request and Onboarding all sign out after 60
+minutes without activity. **S2** Payment Request follows Minty: no 8-hour self-renewing token, it
+signs out when Minty does. **S3** No warning before sign-out, for now. Known limitation: input on
+the step or form open at that moment is lost.
+
+- **The idle limit is the row's.** `SESSION_COOKIE_AGE = 3600`: `django_session.expire_date` is
+  pushed 60 minutes on by every save - the front door's presence refresh, at most once a minute
+  (`refresh_presence`, from every hand-off, `/enter`, `/entity`...) - and by every touch below.
+  The browser keeps the cookie 24 hours (`hub/session_store.COOKIE_SECONDS`, the store's
+  `get_expiry_age`): activity in another app extends the row but cannot re-set the cookie, so a
+  cookie lapsing first would end a live sign-in. A cookie naming an expired row is nobody.
+- **The `sid`.** Every hand-off token (module AND onboarding) carries `sid` = the sign-in's random
+  128-bit `login_sid`. The session's KEY is `session_key_for(sid)` = HMAC-SHA256(`SECRET_KEY`,
+  `"minty-hub-session:" + sid`), first 32 hex characters. So this service finds the row from a
+  token's `sid` with one primary-key read and no table of its own, while a token never carries the
+  key (the cookie's value): holding a 30-minute token for one app must not let anyone become the
+  person in the hub, and going from `sid` to key needs `SECRET_KEY`, which already mints every
+  token. A session made before Phase 9 (a random key) is bound at its next hand-off (`login_sid`
+  gives it a fresh sid and the derived key; the old row is deleted) - nobody is signed out for it.
+- **`POST /api/internal/session/touch {"sid"}`** (`hub/session_store.py`): a Minty backend's
+  service assertion, scoped `session-touch` (anything else 401 `{"error": "Unauthorized"}`).
+  200 `{"alive": true}` and the row's expiry pushed on - only `expire_date` is updated, never the
+  data, so a hub request saving at the same moment loses nothing; **410** `{"error": "This
+  sign-in has ended."}` for no live row, a row whose `login_sid` is another, or a person gone or
+  switched off; 422 for a missing or malformed `sid`; GET 405.
+- **Every API asks it** through `minty_shared.tokens.session_alive(sid, ACCOUNTS_API_URL,
+  SECRET_KEY)` (minty-shared v0.8), after the token is verified: minty-petty-cash-api,
+  minty-payment-request-api (both auth classes), minty-onboarding-api and minty-subscription-api
+  (every door). At most once a minute per `sid` per process (`SessionGate`); the ask is the
+  activity, so ANY API call keeps the sign-in alive. 410 = the token is refused (401), and each
+  app's 401 path hands the person over again: minty-web and Petty Cash re-hand-off, Payment
+  Request reloads the same company address through its middleware (accounts-api's company
+  hand-off), Onboarding's `/state` re-check relaunches through `/entity/<co>/modules` - all of
+  which reach the sign-in page when the session is gone. So signing out of Minty ends every app.
+  This service's hub door (`hub/transport.bearer_claims`) touches directly, same cache, no HTTP.
+- **A token with no `sid`** (minted before Phase 9, or by hand) passes until it expires - no mass
+  sign-out at release. **accounts-api unreachable**, or any answer but 200/410 (a 404 from an
+  accounts-api without the route included), is logged at ERROR and the token honoured (it is still
+  a signed, unexpired credential), then asked about again a minute later.
+- **"Your session has expired" (owner, 2026-11-19).** The two 401s are told apart on the server:
+  `minty_shared.tokens.session_ended(token, ACCOUNTS_API_URL, SECRET_KEY)` is True when the
+  token's signature verifies (its expiry ignored, for this question only) and its `sid`'s sign-in
+  has ended. Every API's 401 then adds **`"reason": "session_expired"`** to its usual body
+  (`mark_session_ended` in the auth, `unauthorized_reason` in the 401 handler) - whether the token
+  was still valid or had run out too: petty-cash-api `{"error": "unauthorized", "reason":
+  "session_expired"}`, payment-request-api `{"detail": "Unauthorized", "reason": ...}`,
+  onboarding-api and subscription-api `{"error": "Unauthorized", "reason": ...}`, and this
+  service's hub door `{"error": "unauthorized", "reason": ...}` (`/api/onboarding/*`:
+  `"Unauthorized"`). A 401 for a token that merely ran out while its sign-in lives, or one with no
+  `sid`, a forged or a malformed one, carries no reason: the app renews quietly as before. Each
+  app reads the reason where it reads its 401s and calls ONE local `showSessionExpired(loginUrl)`
+  (`lib/sessionExpired.ts`), once however many calls fail together: today it goes straight to the
+  sign-in page; the pop-up ("Your session has expired", one OK) is to come from `@minty/shared`.
+  `loginUrl` = minty-web's `/login` (in minty-web) or this service's front door `/` (the other
+  apps, which know no `MINTY_WEB_URL`), with `next` = the app's re-hand-off back to the page the
+  person was on. **The front door** (`hub/front_door.py`): `GET /` signed in goes straight to a
+  safe `next` (someone who signed in again in another tab), else `/entity`. And when a hand-off
+  (`signed_in_or_door`) finds the browser's cookie naming a sign-in that has ENDED
+  (`hub/session.sign_in_ended`: an expired row that held a person, or a row that is gone - never
+  a browser with no cookie, nor a live session that never held a sign-in), it sends `expired=1`
+  instead of "Please log in to access this page.", and `hub_login_url(..., expired=True)` passes it
+  to minty-web's `/login?expired=1` - the usual case after 60 idle minutes, when the app's token
+  (whose cookie lives as long as it) ran out at the same time.
+- Tests never call the touch: `minty_shared.testing.sessions` (each API's root `conftest.py`) fakes
+  it - every sign-in lives unless `hub_sessions.end(sid)`. The e2e helpers that mint their own
+  tokens mint them with no `sid` (a made-up one names no sign-in and is refused).
+
 ## 4. The terms gate
 
 `hub/terms_gate.py` (middleware, after the session): a person signed in through the cookie who
@@ -276,7 +348,7 @@ minty-onboarding-api; a mismatch 401s every call). `hub/handoffs.py`, with Flask
 | Token | Minted by | Lifetime | Claims | Verified by |
 |---|---|---|---|---|
 | module | `module_token`, at every hand-off into minty-web, the payments app and Petty Cash web | 30 min | `user_id`, `entity_id` (empty when unscoped), `xero_org_id`, `role`, `system_role`, `module: "billing"`, `sid` (the sign-in's `login_sid`), `billing_enabled`, `petty_cash_enabled`, `is_view_only` (a system super admin in a company they are not a member of), `iat`, `exp` | minty-payment-request-api `core/auth.BearerAuth`, minty-subscription-api, minty-petty-cash-api (module tokens only), this service's hub door |
-| onboarding | `onboarding_token`, when the wizard is launched (`/entity/create`, a company still onboarding) | 60 min | `user_id`, `scope: "onboarding"`, `iat`, `exp` | minty-onboarding-api `core/auth.OnboardingBearerAuth`; this service's `/api/onboarding/*` (`hub/onboarding.py`) |
+| onboarding | `onboarding_token`, when the wizard is launched (`/entity/create`, a company still onboarding) | 30 min (every app the same, owner 2026-11-19; was 60) | `user_id`, `scope: "onboarding"`, `sid` (Phase 9), `iat`, `exp` | minty-onboarding-api `core/auth.OnboardingBearerAuth`; this service's `/api/onboarding/*` (`hub/onboarding.py`) |
 
 - **Into the apps** (signed in, else the front door with `next`): the browser goes to the app's
   `/landing?next=&entity_id=&entity_name=&code=`, or the onboarding app's
@@ -289,8 +361,10 @@ minty-onboarding-api; a mismatch 401s every call). `hub/handoffs.py`, with Flask
   - `GET /handoff/minty-web?next=&entity_id=` and `GET /profile?entity_id=` (the payments app's
     old `/profile*` links; minty-web has no My Profile page since 2026-11-03, so it lands on
     `/entities`, where My Profile opens in the sidebar): a fresh token at the click.
-  - minty-payment-request-web keeps the token in its `billing_token` cookie and re-mints it
-    through minty-payment-request-api's `POST /api/auth/token/refresh`.
+  - minty-payment-request-web keeps the token in its `billing_token` cookie for exactly the
+    token's 30 minutes. There is no refresh any more (Phase 9: the 8-hour
+    `POST /api/auth/token/refresh` is gone): a 401 clears the cookie and reloads the same company
+    address, which its middleware sends through `/entity/<co>/payment-request`.
 - **minty-petty-cash-web** is entered the minty-web way. `GET /handoff/petty-cash-web?next=&entity_id=`
   mints a module token for ONE company the person may see, past onboarding (else the wizard), with
   Petty Cash on; `entity_id` may be the app's `<shortid>/<name>` form. The app keeps it in its
@@ -299,9 +373,9 @@ minty-onboarding-api; a mismatch 401s every call). `hub/handoffs.py`, with Flask
 - **The hub's door** (`hub/transport.py`): minty-web, the payments app and Petty Cash read the
   hub routes (`/api/me/entities`, `/api/me/profile`, `/api/me/terms*`, `/api/me/contact`,
   `/api/me/company/*`) with that token - bearer only (`minty_shared.tokens.decode_bearer`, 60 s
-  skew), any Minty token, no scope check; a token naming an unknown or unapproved account is 401
-  `{"error": "unauthorized"}`. The company travels as `?entity=` and is checked per route, never
-  read from the token. CORS echoes the three front ends, their `EXTRA_FRONTEND_ORIGINS` and their
+  skew), any Minty token, no scope check; a token naming an unknown or unapproved account, or whose
+  sign-in has ended (section 3.3), is 401 `{"error": "unauthorized"}`. The company travels as
+  `?entity=` and is checked per route, never read from the token. CORS echoes the three front ends, their `EXTRA_FRONTEND_ORIGINS` and their
   preview sets, refusals included.
 - **Coming back** is `GET /entity/<co>/enter?next=`: a browser signed in here is sent straight on
   (`next` is a path on this site, else the company's Petty Cash); with no session it goes to the
@@ -440,7 +514,8 @@ Every service's variables are listed in minty-infra's
 the single-use hand-off, invitations by code), `hub/tests/test_session.py` (the session, presence,
 flashes, the headers, the redacted path, the cookie's name and flags),
 `hub/tests/test_handoffs.py` (the tokens and their claims, every hand-off, `/enter`, sign-out and
-leaving as POSTs from a front end, the Terms gate), `hub/tests/test_xero_oauth.py` (scopes, the
+leaving as POSTs from a front end, the Terms gate), `hub/tests/test_session_idle.py` (the 60-minute
+idle limit, the sid-bound key, the session touch, the hub door ending with the sign-in), `hub/tests/test_xero_oauth.py` (scopes, the
 nonce, sign-in and invitations with Xero, connect and reconnect), `hub/tests/test_redirects.py`
 (the settings tabs, report history, share links, the old addresses),
 `hub/tests/test_public_and_transport.py` (the public routes and the hub's door),

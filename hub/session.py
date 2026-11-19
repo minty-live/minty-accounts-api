@@ -3,11 +3,13 @@
 
 The session is Django's (``django_session``, settings ``SESSION_*``). There is no
 ``django.contrib.auth``: the session holds the minty-db user's id and the sign-in's id
-(``login_sid``, the module tokens' ``sid`` claim), nothing else that grants anything.
+(``login_sid``, every hand-off token's ``sid`` claim, from which the session's key is derived -
+``hub/session_store.py``), nothing else that grants anything. 60 minutes without activity ends it
+(Phase 9).
 
 - ``signed_in_user(request)``: the approved person the cookie names, else None. A cookie naming a
   person who is gone or switched off is emptied (Flask's ``before_request_middleware``).
-- ``sign_in(request, user)``: a NEW session key (no fixation), a fresh ``login_sid``, and the
+- ``sign_in(request, user)``: a NEW session key (no fixation; derived from a fresh ``login_sid``), and the
   presence stamps Flask's ``user_logged_in`` signal wrote. ``sign_out(request)``: the reverse.
 - ``flash`` / ``drain_flashes``: Flask's flashed messages, carried in the session until a redirect
   signs them into ``?flash=`` (``hub/notices.sign_notices``).
@@ -24,11 +26,15 @@ import time
 import uuid
 from urllib.parse import urlsplit
 
+from django.conf import settings
+from django.contrib.sessions.models import Session
 from django.db.models import Case, F, Value, When
 from django.db.models.functions import Coalesce
 from django.http import HttpRequest
 from django.utils import timezone
 from minty_db.models import User
+
+from hub.session_store import SessionStore, session_key_for
 
 logger = logging.getLogger("minty-accounts-api")
 
@@ -55,11 +61,29 @@ def signed_in_user(request: HttpRequest) -> User | None:
     return user
 
 
+def sign_in_ended(request: HttpRequest) -> bool:
+    """Whether the browser came with a cookie naming a sign-in that has ENDED - 60 minutes without
+    activity, or signed out or switched off since (2026-11-19: the hub's sign-in page then says
+    "Your session has expired"). Asked once nobody is signed in by the cookie: an expired row that
+    held a person, or a row that is gone. A live row is a session that never held a sign-in (a
+    flashed message, a preview set), and no cookie is a browser that was never signed in."""
+    key = request.COOKIES.get(settings.SESSION_COOKIE_NAME)
+    if not key:
+        return False
+    row = Session.objects.filter(session_key=key).first()
+    if row is None:
+        return True
+    if row.expire_date > timezone.now():
+        return False
+    return bool(SessionStore().decode(row.session_data).get(USER_KEY))
+
+
 def sign_in(request: HttpRequest, user: User) -> None:
-    request.session.cycle_key()
+    sid = uuid.uuid4().hex
+    request.session.bind(sid)  # a new key, derived from the sid (hub/session_store.py)
     request.session.pop("terms_ok", None)  # a new sign-in is checked against the Terms afresh
     request.session[USER_KEY] = str(user.id)
-    request.session[LOGIN_SID_KEY] = uuid.uuid4().hex
+    request.session[LOGIN_SID_KEY] = sid
     request.session["last_activity"] = time.time()
     request.session[PRESENCE_KEY] = time.time()
     mark_signed_in(user)
@@ -75,7 +99,15 @@ def sign_out(request: HttpRequest) -> None:
 
 
 def login_sid(request: HttpRequest) -> str | None:
-    return request.session.get(LOGIN_SID_KEY)
+    """The sign-in's id, for a hand-off token's ``sid``. A session from before Phase 9 (a random
+    key, so its sid finds nothing) is bound here first - a fresh sid and the key derived from it -
+    so its tokens can be touched; nobody is signed out for it."""
+    sid = request.session.get(LOGIN_SID_KEY)
+    if request.session.get(USER_KEY) and (not sid or request.session.session_key != session_key_for(sid)):
+        sid = uuid.uuid4().hex
+        request.session.bind(sid)
+        request.session[LOGIN_SID_KEY] = sid
+    return sid
 
 
 # ---- flashed messages ---------------------------------------------------------------------------

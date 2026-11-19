@@ -47,8 +47,6 @@ import uuid
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-import requests
-from django.conf import settings
 from django.db import connection, transaction
 from django.db.models import Q
 from django.utils import timezone
@@ -57,7 +55,6 @@ from minty_db.models import (
     AccountInfo,
     AccountMatchDraft,
     AccountModule,
-    Bill,
     BillLine,
     ContactChangeLog,
     Entity,
@@ -76,7 +73,6 @@ from xero.services.connect import MirrorFailed
 logger = logging.getLogger("minty-accounts-api")
 
 HK = ZoneInfo("Asia/Hong_Kong")
-XERO_TIMEOUT = (10, 30)
 
 #: Xero's account type -> Minty's (the schema's ``account_type_from_xero``, for the same rows).
 TYPE_FROM_XERO = {
@@ -512,33 +508,11 @@ def _survivor(accounts: list[AccountInfo], copy: XeroAccount) -> AccountInfo:
 
 
 def _combine(entity_id, survivor: AccountInfo, others: list[AccountInfo], batch, user_id) -> None:
-    ids = [o.id for o in others]
-    ReportExpense.objects.filter(account_id__in=ids).update(account_id=survivor.id)
-    BillLine.objects.filter(account_id__in=ids).update(account_id=survivor.id)
-    for column in usage.ACCOUNT_SLOTS:
-        EntityPettycashSettings.objects.filter(entity_id=entity_id, **{f"{column}__in": ids}).update(
-            **{column: survivor.id})
-    for module in AccountModule.objects.filter(account_id__in=ids):
-        mine = AccountModule.objects.filter(account_id=survivor.id, module_code=module.module_code).first()
-        if mine is None:
-            AccountModule.objects.create(account_id=survivor.id, module_code=module.module_code, entity_id=entity_id,
-                                         is_active=module.is_active, is_default=False)
-        elif module.is_active and not mine.is_active:
-            AccountModule.objects.filter(account_id=survivor.id, module_code=module.module_code).update(is_active=True)
-    AccountModule.objects.filter(account_id__in=ids).delete()
-    if EntityAccountXero.objects.filter(account_id=survivor.id).exists():
-        EntityAccountXero.objects.filter(account_id__in=ids).delete()
-    else:
-        first = EntityAccountXero.objects.filter(account_id__in=ids).first()
-        if first is not None:
-            EntityAccountXero.objects.filter(id=first.id).update(account_id=survivor.id)
-            EntityAccountXero.objects.filter(account_id__in=ids).delete()
-    for other in others:
-        before = (_code(other), other.name, _minty_type(other))
-        AccountInfo.objects.filter(id=other.id).update(record_status="archived", status="ARCHIVED",
-                                                       merged_into_id=survivor.id)
-        other.record_status, other.status = "archived", "ARCHIVED"
-        _log(batch, entity_id, other, "merged", before, user_id, merged_into=survivor)
+    """The accounts picked to one Xero account become the survivor (decision 18): the one merge
+    (``merge.combine_accounts``, owner's decisions doc M3), recorded in the merging table."""
+    from xero.services import merge
+
+    merge.combine_accounts(entity_id, survivor, others, batch, user_id, reason="xero_matching")
 
 
 def _link(entity_id, account: AccountInfo, copy: XeroAccount, batch, user_id, extra_codes=()) -> None:
@@ -665,38 +639,12 @@ def finish(entity_id, user_id) -> dict:
 # ---- suppliers (frames 4, 5) ------------------------------------------------------------------------
 
 
-def _create_in_xero(access_token, org, name: str) -> dict | None:
-    """One supplier made in Xero under its Minty name; None when Xero refused it (logged)."""
-    try:
-        response = requests.post(f"{settings.XERO_API_BASE_URL}/Contacts", timeout=XERO_TIMEOUT, headers={
-            "Authorization": f"Bearer {access_token}", "Xero-Tenant-Id": str(org), "Accept": "application/json",
-            "Content-Type": "application/json"},
-            json={"Contacts": [{"Name": name, "IsCustomer": False, "IsSupplier": True}]})
-    except requests.RequestException as exc:
-        logger.error("xero matching: contact %r unreachable for org %s: %s", name, org, exc)
-        return None
-    if response.status_code not in (200, 201):
-        logger.error("xero matching: contact %r refused for org %s: %s %s", name, org, response.status_code,
-                     (response.text or "")[:300])
-        return None
-    try:
-        made = ((response.json() or {}).get("Contacts") or [{}])[0]
-    except (ValueError, IndexError):
-        made = {}
-    return made if made.get("ContactID") else None
-
-
 def _merge_supplier(entity_id, supplier: XeroContactSync, into: XeroContactSync, batch, user_id) -> None:
-    """A supplier whose Xero contact is already stored here: its records move to that row."""
-    ReportExpense.objects.filter(contact_id=supplier.id).update(contact_id=into.id)
-    Bill.objects.filter(entity_id=entity_id, contact_id=supplier.id).update(contact_id=into.id)
-    for column in usage.CONTACT_SLOTS:
-        EntityPettycashSettings.objects.filter(entity_id=entity_id, **{column: supplier.id}).update(
-            **{column: into.id})
-    XeroContactSync.objects.filter(id=supplier.id).update(record_status="archived", merged_into_id=into.id)
-    ContactChangeLog.objects.create(entity_id=entity_id, contact_id=supplier.id, batch_id=batch, kind="merged",
-                                    before_name=supplier.name, after_name=into.name, merged_into_id=into.id,
-                                    xero_org_id=into.xero_org_id, xero_guid=into.xero_contact_id, changed_by=user_id)
+    """A supplier whose Xero contact is already stored here: its records move to that row - the one
+    merge (``merge.combine_contacts``, owner's decisions doc M3)."""
+    from xero.services import merge
+
+    merge.combine_contacts(entity_id, into, supplier, batch, user_id, reason="xero_matching")
 
 
 def _link_supplier(entity_id, supplier, guid, name, org, batch, user_id, kind) -> None:
@@ -712,8 +660,10 @@ def _link_supplier(entity_id, supplier, guid, name, org, batch, user_id, kind) -
 
 
 def link_suppliers(entity_id, access_token, org, user_id) -> list[str]:
-    """Every own supplier linked to the Xero contact of its name, else created in Xero (decision 13).
-    Each in its own transaction, so the ones that went through stay; the names Xero refused come back."""
+    """Every own supplier linked to the Xero contact of its name (case and extra spaces ignored,
+    ``sync._name_key``); one with no such contact stays in Minty and goes to Xero at its first
+    publish - connecting creates nothing in Xero (owner's decisions doc C2, 2026-11-19). Each in its
+    own transaction. Returns no names: nothing can be refused (the list stays for the routes' answer)."""
     contacts = sync.fetch_contacts(access_token, org)
     if contacts is None:
         raise Refused(CONTACTS_UNANSWERED, 502)
@@ -723,32 +673,95 @@ def link_suppliers(entity_id, access_token, org, user_id) -> list[str]:
     by_name: dict = {}
     for contact in sorted(contacts, key=lambda c: (str(c.get("ContactStatus") or "ACTIVE").upper() != "ACTIVE",
                                                    str(c.get("ContactID") or ""))):
-        key = (contact.get("Name") or "").strip().lower()
+        key = sync._name_key(contact.get("Name"))
         if key and contact.get("ContactID"):
             by_name.setdefault(key, contact)
     batch = uuid.uuid4()
-    failed: list[str] = []
+    left = 0
     for supplier in list(own_suppliers(entity_id, org).order_by("name")):
-        match = by_name.get((supplier.name or "").strip().lower())
+        match = by_name.get(sync._name_key(supplier.name))
+        if match is None:
+            left += 1  # not in Xero: it goes there at its first publish
+            continue
         with transaction.atomic():
-            if match is not None:
-                guid = match["ContactID"]
-                stored = XeroContactSync.objects.filter(entity_id=entity_id, xero_contact_id=guid).first()
-                if stored is not None:
-                    _merge_supplier(entity_id, supplier, stored, batch, user_id)
-                else:
-                    _link_supplier(entity_id, supplier, guid, match.get("Name"), org, batch, user_id, "linked")
-                continue
-            made = _create_in_xero(access_token, org, supplier.name)
-            if made is None:
-                failed.append(supplier.name)
-                continue
-            _link_supplier(entity_id, supplier, made["ContactID"], made.get("Name"), org, batch, user_id,
-                           "created_in_xero")
-    logger.info("xero matching: company %s suppliers linked; %s Xero refused", entity_id, len(failed))
-    return failed
+            guid = match["ContactID"]
+            stored = XeroContactSync.objects.filter(entity_id=entity_id, xero_contact_id=guid).first()
+            if stored is not None:
+                _merge_supplier(entity_id, supplier, stored, batch, user_id)
+            else:
+                _link_supplier(entity_id, supplier, guid, match.get("Name"), org, batch, user_id, "linked")
+    logger.info("xero matching: company %s suppliers linked by name; %s stay in Minty until a publish", entity_id,
+                left)
+    return []
 
 
 def complete(entity_id) -> None:
     """Matching done and every supplier in Xero: the company is connected."""
     Entity.objects.filter(id=entity_id).update(status="connected", last_connected_at=timezone.now())
+
+
+# ---- one account, mapped again (the owner's decisions doc A3, 2026-11-19) ----------------------------
+
+#: A3's sentence: shown at Settings and at Publish for an account Xero archived or removed.
+GONE_FROM_XERO = ("This account is archived in Xero. Please check it in Xero, then map this account to the one "
+                  "you want to use.")
+TAKEN = "{other} is already linked to that Xero account. Merge {name} into {other} instead."
+NOT_A_XERO_ACCOUNT = "Choose one of your Xero accounts."
+
+
+class Taken(Refused):
+    """The Xero account picked is another active account's: merge instead (the user's A3 clash rule)."""
+
+    def __init__(self, account: AccountInfo, holder: AccountInfo):
+        super().__init__(TAKEN.format(other=holder.name, name=account.name), 409)
+        self.holder = holder
+
+
+def _mappable(entity_id, account_id) -> AccountInfo:
+    account = AccountInfo.objects.filter(entity_id=entity_id, id=account_id, merged_into__isnull=True).first()
+    if account is None:
+        raise Refused(NOT_OWN, 404)
+    return account
+
+
+def read_one(entity: Entity, account_id) -> dict:
+    """The one-account matching page (A3): the account, as the matching page draws a row, and the Xero
+    accounts it can be mapped to."""
+    account = _mappable(entity.id, account_id)
+    copies = _copies(entity.id, entity.xero_org_id) if entity.xero_org_id else []
+    account_type = _minty_type(account)
+    suggestion = _suggestion(account, copies)
+    gone = bool(account.xero_account_id) and (account.status or "").upper() != "ACTIVE"
+    return {
+        "organisation": entity.xero_tenant_name,
+        "gone_from_xero": gone,
+        "message": GONE_FROM_XERO if gone else None,
+        "row": {"account_id": str(account.id), "code": _code(account), "name": account.name, "type": account_type,
+                "kind": "bank" if account_type == "bank" else _class(account_type),
+                "used": account.id in usage.used_account_ids(entity.id), "system": bool(account.is_system),
+                "pick": None, "suggestion": str(suggestion.id) if suggestion else None, "conflict": None,
+                "combined_with": []},
+        "options": [{"id": str(c.id), "code": c.code or "", "name": c.name,
+                     "kind": "bank" if _copy_type(c) == "bank" else _class(_copy_type(c))} for c in copies],
+    }
+
+
+def map_one(entity: Entity, account_id, copy_id, user_id) -> dict:
+    """The account linked to the Xero account picked - Xero's code, name and type, as at matching's
+    Finish (``_link``). Only that account's link changes: no records move and nothing goes in the
+    merging table (A3). Raises ``Taken`` when another active account holds that Xero account."""
+    with transaction.atomic():
+        sync.lock(entity.id)
+        account = _mappable(entity.id, account_id)
+        copy = XeroAccount.objects.filter(entity_id=entity.id, xero_org_id=str(entity.xero_org_id or ""), id=copy_id,
+                                          status="ACTIVE").first()
+        if copy is None:
+            raise Refused(NOT_A_XERO_ACCOUNT, 422)
+        holder = (AccountInfo.objects.filter(entity_id=entity.id, xero_account_id=copy.xero_guid,
+                                             record_status="active").exclude(id=account.id).first())
+        if holder is not None:
+            raise Taken(account, holder)
+        _link(entity.id, account, copy, uuid.uuid4(), user_id)
+    logger.info("xero matching: company %s account %s mapped to Xero account %s", entity.id, account.id,
+                copy.xero_guid)
+    return {"message": f"{account.name} now uses {copy.name} in Xero.", "account_id": str(account.id)}

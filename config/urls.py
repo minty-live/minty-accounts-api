@@ -18,11 +18,12 @@ from hub import (
     profile,
     public,
     redirects,
+    session_store,
     terms,
     xero_matching,
     xero_oauth,
 )
-from xero.views import internal_xero_access_token, internal_xero_sync
+from xero.views import internal_contact_relink, internal_xero_access_token, internal_xero_sync
 
 
 def health(request):
@@ -36,6 +37,10 @@ urlpatterns = [
     path("api/internal/xero/token", internal_xero_access_token, name="internal_xero_access_token"),
     # Phase 3 (2026-11-06): the one Xero account/contact sync, new (Flask's ran in each caller).
     path("api/internal/xero/sync", internal_xero_sync, name="internal_xero_sync"),
+    path("api/internal/xero/contacts/<str:contact_id>/relink", internal_contact_relink,
+         name="internal_contact_relink"),
+    # Phase 9 (2026-11-19): the other APIs keep a sign-in alive, and learn it has ended.
+    path("api/internal/session/touch", session_store.internal_session_touch, name="internal_session_touch"),
     path("api/handoff/redeem", handoffs.redeem_code, name="redeem_handoff_code"),
     # Phase 5 (2026-11-06): the public routes, Flask's paths.
     path("auth/notices", public.auth_notices, name="auth_notices"),
@@ -66,10 +71,16 @@ urlpatterns = [
     path("api/me/company/accounts/<str:account_id>", company_chart.company_account, name="company_account"),
     path("api/me/company/contacts", company_chart.company_contacts, name="company_contacts"),
     path("api/me/company/contacts/<str:contact_id>", company_chart.company_contact, name="company_contact"),
+    path("api/me/company/accounts/<str:account_id>/merge", company_chart.company_account_merge,
+         name="company_account_merge"),
+    path("api/me/company/contacts/<str:contact_id>/merge", company_chart.company_contact_merge,
+         name="company_contact_merge"),
     path("api/me/company/xero/disconnect", company.company_xero_disconnect, name="company_xero_disconnect"),
     path("api/me/company/xero/release", company.company_xero_release, name="company_xero_release"),
     # Settings Phase 2 (2026-11-11): matching a Minty company's accounts to Xero on connect.
     path("api/me/company/xero/matching", xero_matching.company_xero_matching, name="company_xero_matching"),
+    path("api/me/company/xero/matching/account", xero_matching.company_xero_matching_account,
+         name="company_xero_matching_account"),
     path("api/me/company/xero/matching/refresh", xero_matching.company_xero_matching_refresh,
          name="company_xero_matching_refresh"),
     path("api/me/company/xero/matching/finish", xero_matching.company_xero_matching_finish,

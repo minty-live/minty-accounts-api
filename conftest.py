@@ -7,9 +7,12 @@ path in ``config/settings_test.py`` applies.
 ``minty_db.testing.uuid_guard``: ids are ``uuid.UUID`` while token claims and JSON carry text;
 under test, this service's code comparing a UUID with uuid text raises instead of quietly not
 matching.
+
+``minty_shared.testing.sessions`` (Phase 9): every test starts with an empty memory of which
+sign-ins live (``minty_shared.tokens.SESSIONS``).
 """
 
-pytest_plugins = ["minty_db.testing.pg", "minty_db.testing.uuid_guard"]
+pytest_plugins = ["minty_db.testing.pg", "minty_db.testing.uuid_guard", "minty_shared.testing.sessions"]
 
 
 import pytest  # noqa: E402

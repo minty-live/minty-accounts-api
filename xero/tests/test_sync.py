@@ -216,6 +216,38 @@ def test_the_route_syncs_the_assertions_company(db, xero):
                            "contacts": {"added": 0, "linked": 0, "renamed": 0}}
 
 
+def test_a_settings_read_runs_at_most_once_every_two_minutes(db, xero):
+    """Opening Settings reads Xero at most once every 2 minutes per company (owner's decisions doc
+    C2, 2026-11-19): ``{"throttle": true}`` skips a read when the company's contacts were read under
+    2 minutes ago. A call without it (onboarding's saves, Payment Requests) always reads."""
+    import json
+
+    from django.utils import timezone
+    from minty_db.models import XeroContact
+
+    owner = make_user()
+    entity = make_entity(connected_by=owner)
+    UserToken.objects.create(id=uuid.uuid4(), user_id=owner.id, access_token="tok", refresh_token="r",
+                             access_token_expires_in=1800, access_token_obtained_at=datetime.now(UTC))
+    xero.contact_pages = [[{"ContactID": "c-1", "Name": "ABC Supplies"}]]
+
+    def settings_read():
+        return Client().post("/api/internal/xero/sync", data=json.dumps({"throttle": True}),
+                             content_type="application/json", HTTP_AUTHORIZATION="Bearer " + _assertion(entity.id))
+
+    first = settings_read()
+    assert first.status_code == 200 and first.json()["contacts"] is not None
+    asked = len(xero.asked)
+    again = settings_read()
+    assert (again.status_code, again.json()) == (200, {"accounts": None, "contacts": None, "skipped": True})
+    assert len(xero.asked) == asked, "Xero not asked again within 2 minutes"
+    assert _post(entity.id).json()["contacts"] is not None, "an unthrottled call always reads"
+
+    XeroContact.objects.filter(entity_id=entity.id).update(synced_at=timezone.now() - timedelta(minutes=3))
+    later = settings_read()
+    assert later.json()["contacts"] is not None and len(xero.asked) > asked
+
+
 def test_the_route_refuses_a_token_for_another_route_and_a_company_with_no_connection(db, xero):
     entity = make_entity()
     assert _post(entity.id, scope="xero-access-token").status_code == 401
@@ -263,7 +295,7 @@ def test_a_recode_follows_and_an_account_xero_dropped_is_marked_deleted_in_the_c
     assert copies["a-2"].status == "DELETED", "kept, as the sync marks what Xero no longer sends"
 
 
-def test_each_contact_gets_its_copy_and_a_minty_supplier_goes_to_xero(company, xero):
+def test_each_contact_gets_its_copy_and_a_minty_supplier_stays_in_minty(company, xero):
     from minty_db.models import XeroContact
 
     XeroContactSync.objects.create(entity_id=company.id, name="Kept In Minty", source="user")
@@ -275,10 +307,11 @@ def test_each_contact_gets_its_copy_and_a_minty_supplier_goes_to_xero(company, x
     copy = XeroContact.objects.get(entity_id=company.id, xero_guid="c-1")
     assert (copy.name, copy.xero_org_id) == ("ABC Supplies Ltd", TENANT)
     assert XeroContactSync.objects.get(xero_contact_id="c-1").xero_contact_link_id == copy.id
-    # made in Minty while offline: made in Xero on the live sync, once (owner, 2026-11-12)
+    # the sync only reads (owner's decisions doc C2, 2026-11-19): made in Minty, it reaches Xero at
+    # its first publish, never here
     minty = XeroContactSync.objects.get(entity_id=company.id, name="Kept In Minty")
-    assert minty.xero_contact_id == "made-Kept In Minty" and minty.xero_contact_link_id is not None
-    assert xero.made == ["Kept In Minty"]
+    assert (minty.xero_contact_id, minty.xero_contact_link_id) == (None, None)
+    assert xero.made == []
 
 
 def test_a_disconnect_keeps_every_account_and_the_copies(company, xero):
@@ -401,7 +434,7 @@ def test_a_minty_account_and_a_hand_added_bill_code_are_never_touched(company, x
     assert EntityBillAccountXero.objects.filter(entity_id=company.id, account_code="420").exists()
 
 
-def test_the_connect_sync_keeps_a_minty_supplier_and_puts_it_in_xero(company, xero):
+def test_the_connect_sync_keeps_a_minty_supplier_and_sends_nothing_to_xero(company, xero):
     from xero.services.connect import background_sync
 
     XeroContactSync.objects.create(entity_id=company.id, name="Kept In Minty", source="user")
@@ -413,8 +446,8 @@ def test_the_connect_sync_keeps_a_minty_supplier_and_puts_it_in_xero(company, xe
 
     names = set(XeroContactSync.objects.filter(entity_id=company.id).values_list("name", flat=True))
     assert names == {"Kept In Minty", "ABC Supplies"}, "an unused Xero contact Xero dropped still goes"
-    assert XeroContactSync.objects.get(entity_id=company.id, name="Kept In Minty").xero_contact_id == (
-        "made-Kept In Minty")
+    assert XeroContactSync.objects.get(entity_id=company.id, name="Kept In Minty").xero_contact_id is None
+    assert xero.made == []  # connecting creates nothing in Xero (C2)
 
 
 def test_a_xero_contact_of_a_minty_contacts_name_links_to_it_never_a_second_row(company, xero):

@@ -12,19 +12,21 @@ from urllib.parse import parse_qs, quote, urlsplit
 import jwt
 import pytest
 from django.conf import settings
-from django.contrib.sessions.backends.db import SessionStore
 from django.test import Client
 from minty_db.models import Entity, EntityFunction, EntityFunctionMap, User, UserEntity
 
 from hub import handoffs
+from hub.session_store import SessionStore
 from hub.tests.test_public_and_transport import make_user
 
 HUB, PAY, PETTY, ONB = (settings.MINTY_WEB_URL, settings.PAYMENT_REQUEST_WEB_URL, settings.PETTY_CASH_WEB_URL,
                         settings.ONBOARDING_WEB_URL)
 
 
-def login(client: Client, user: User, sid: str = "sid-1", agreed: bool = True) -> Client:
-    """A signed-in browser (a session row and its cookie); ``agreed`` records the live Terms."""
+def login(client: Client, user: User, sid: str | None = None, agreed: bool = True) -> Client:
+    """A signed-in browser (a session row and its cookie); ``agreed`` records the live Terms. Each
+    sign-in its own sid (the session key is derived from it)."""
+    sid = sid or f"sid-{uuid.uuid4().hex}"
     if agreed:
         from minty_db.models import TermsConsent
 
@@ -34,7 +36,7 @@ def login(client: Client, user: User, sid: str = "sid-1", agreed: bool = True) -
                                            defaults={"document_hash": "h", "source": "hub"})
     store = SessionStore()
     store.update({"user_id": str(user.id), "login_sid": sid})
-    store.create()
+    store.bind(sid)  # the key sign_in gives a session (Phase 9: derived from the sid)
     client.cookies["session"] = store.session_key
     return client
 
@@ -98,7 +100,8 @@ def test_the_company_slug_keeps_unicode_letters():
 
 def test_a_member_lands_on_the_companys_petty_cash_with_a_module_token(shop):
     entity = shop["entity"]
-    query = landing(login(Client(), shop["owner"]).get("/handoff/petty-cash-web", {"entity_id": str(entity.id)}), PETTY)
+    query = landing(login(Client(), shop["owner"], sid="sid-1").get("/handoff/petty-cash-web",
+                                                                    {"entity_id": str(entity.id)}), PETTY)
     assert query["next"] == [f"/entity/{str(entity.id)[:8]}/vine-café-central/petty-cash"]
     assert (query["entity_id"], query["entity_name"]) == ([str(entity.id)], ["Vine Café Central"])
     token = claims(query)

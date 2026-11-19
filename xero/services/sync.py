@@ -38,6 +38,7 @@ Flask's own syncs while both exist.
 from __future__ import annotations
 
 import logging
+from datetime import timedelta
 
 import requests
 from django.conf import settings
@@ -58,6 +59,8 @@ logger = logging.getLogger("minty-accounts-api")
 
 TIMEOUT = (10, 60)
 CONTACTS_PAGE = 1000
+#: Opening Settings reads Xero at most this often per company (owner's decisions doc C2, 2026-11-19).
+SETTINGS_READ_EVERY = timedelta(minutes=2)
 #: Types Petty Cash's chart never shows (Flask's ``COA_EXCLUDED_TYPES``): their names aren't refreshed.
 COA_EXCLUDED_TYPES = frozenset({"BANK", "EQUITY", "OTHERINCOME", "SALES", "REVENUE"})
 #: ``account_info.source`` of a row Minty made (Auto Fill, or added by a person): never deleted here.
@@ -148,8 +151,10 @@ def apply_accounts(entity_id, accounts: list[dict], org) -> dict:
         used = usage.used_account_ids(entity_id)
         kept = {}
         for row in rows:
-            if not row.xero_account_id:
-                continue  # Minty's own account (or one combined away): the sync never touches it
+            if not row.xero_account_id or row.merged_into_id is not None:
+                # Minty's own account, or one merged away - kept as the record of its merge
+                # (owner's decisions doc M2): the sync never touches it
+                continue
             if row.xero_account_id not in snapshot:
                 if row.id in used or row.source in MINTY_MADE:
                     if row.status != "ARCHIVED":
@@ -397,6 +402,14 @@ def _copy_contacts(entity_id, contacts: list[dict], org) -> None:
             row.save(update_fields=["xero_contact_link"])
 
 
+def read_recently(entity_id) -> bool:
+    """The company's Xero contacts were read under ``SETTINGS_READ_EVERY`` ago: every sync stamps
+    each copy's ``synced_at`` (``_copy_contacts``), so the newest stamp is the last read. Two workers
+    may both read once at the edge; nothing worse."""
+    newest = XeroContact.objects.filter(entity_id=entity_id).aggregate(newest=models.Max("synced_at"))["newest"]
+    return newest is not None and timezone.now() - newest < SETTINGS_READ_EVERY
+
+
 def sync_company(entity_id, access_token: str, org) -> dict:
     """Both halves. ``{"accounts": counts | None, "contacts": counts | None}``; None = Xero
     could not be asked (nothing changed)."""
@@ -419,34 +432,9 @@ def sync_company(entity_id, access_token: str, org) -> dict:
         logger.info("xero sync: company %s is matching its accounts; only the Xero copies refreshed", entity_id)
         return {"accounts": {"copied": len(accounts or [])} if accounts else None,
                 "contacts": {"copied": len(contacts)} if contacts is not None else None}
-    answer = {
+    # The sync only reads (owner's decisions doc C2, 2026-11-19): a contact made in Minty reaches
+    # Xero when it is added while connected (C5) or at its first publish (C1), never here.
+    return {
         "accounts": apply_accounts(entity_id, accounts, org) if accounts else None,
         "contacts": apply_contacts(entity_id, contacts, org) if contacts is not None else None,
     }
-    if contacts is not None:
-        _push_own_contacts(entity_id, access_token, org)
-    return answer
-
-
-def _push_own_contacts(entity_id, access_token: str, org) -> None:
-    """The company's contacts made in Minty while it was offline go to Xero on every live sync,
-    the connect's first included (owner, 2026-11-12): each linked to Xero's of its name, else made
-    there (``matching.link_suppliers``). A name Xero refuses stays in Minty for the next sync."""
-    from minty_db.models import Entity
-
-    from xero.services import matching
-
-    if Entity.objects.filter(id=entity_id).filter(
-            models.Q(setup_mode="minty") | models.Q(xero_matching__isnull=False)).exists():
-        return  # a matching links them at its Finish (the suppliers step)
-    if not matching.own_suppliers(entity_id).exists():
-        return
-    try:
-        failed = matching.link_suppliers(entity_id, access_token, org, None)
-    except matching.Refused as refused:
-        logger.warning("xero sync: company %s contacts not pushed (%s); next sync tries again", entity_id,
-                       refused)
-        return
-    if failed:
-        logger.warning("xero sync: company %s: Xero refused %s contact(s); next sync tries again", entity_id,
-                       len(failed))

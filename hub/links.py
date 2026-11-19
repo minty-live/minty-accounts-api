@@ -107,11 +107,14 @@ class PreviewMiddleware:
 
 def hub_login_url(request: HttpRequest | None, *, next_path: str | None = None, mode: str | None = None,
                   invite: str | None = None, email: str | None = None, first_name: str | None = None,
-                  last_name: str | None = None, carry_flashes: bool = True) -> str:
-    """``{hub}/login?...`` (``/signup`` when ``mode`` is ``"signup"``)."""
+                  last_name: str | None = None, carry_flashes: bool = True, expired: bool = False) -> str:
+    """``{hub}/login?...`` (``/signup`` when ``mode`` is ``"signup"``). ``expired``: the hub
+    sign-in this browser had has ended - the page says "Your session has expired" (2026-11-19)."""
     params: dict[str, str] = {}
     if safe := safe_internal_path(next_path):
         params["next"] = safe
+    if expired:
+        params["expired"] = "1"
     for key, value in (("invite", invite), ("email", email), ("fn", first_name), ("ln", last_name)):
         if value:
             params[key] = value

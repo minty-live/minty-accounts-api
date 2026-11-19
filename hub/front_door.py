@@ -1,12 +1,17 @@
 """The front door - Flask's ``auth/routes/home.py``, ``register.py``, ``dashboard.py`` and
 Flask-Login's ``login_required`` (Phase 6 of the Flask retirement, 2026-11-06).
 
-- ``GET /``: signed in, the company list (``/entity``); otherwise minty-web's sign-in page with
-  ``next`` (where the person was being sent) and anything flashed on the way.
+- ``GET /``: signed in, ``next`` when it is a path on this site, else the company list
+  (``/entity``); otherwise minty-web's sign-in page with ``next`` (where the person was being
+  sent), ``expired=1`` when the door said so, and anything flashed on the way. The apps' "Your
+  session has expired" pop-up sends the person here with their hand-off as ``next`` (2026-11-19).
 - ``GET /register``: sign-up is minty-web's ``/signup``; nothing is made here.
 - ``GET /index``: the company list (old links and redirects still name it).
 - ``signed_in_or_door(request)``: Flask-Login's gate - the signed-in person, or a redirect to ``/``
-  with ``next`` (this request's path and query) and "Please log in to access this page." (info).
+  with ``next`` (this request's path and query) and "Please log in to access this page." (info) -
+  or, when the cookie names a sign-in that has ended (``sign_in_ended``: 60 minutes without
+  activity, signed out), ``expired=1`` instead of the message: the sign-in page then says "Your
+  session has expired" (2026-11-19).
 """
 
 from __future__ import annotations
@@ -17,7 +22,7 @@ from django.http import HttpRequest, HttpResponse, HttpResponseNotAllowed, HttpR
 from minty_db.models import User
 
 from hub.links import hub_login_url
-from hub.session import flash, refresh_presence, signed_in_user
+from hub.session import flash, refresh_presence, safe_internal_path, sign_in_ended, signed_in_user
 
 LOGIN_MESSAGE = "Please log in to access this page."
 
@@ -27,16 +32,24 @@ def signed_in_or_door(request: HttpRequest) -> tuple[HttpResponse | None, User |
     if user is not None:
         refresh_presence(request, user)
         return None, user
-    flash(request, LOGIN_MESSAGE, "info")
-    return HttpResponseRedirect("/?" + urlencode({"next": request.get_full_path()})), None
+    query = {"next": request.get_full_path()}
+    if sign_in_ended(request):
+        # An app renewing its token after the hub sign-in ended (60 idle minutes, or signed out):
+        # the sign-in page says "Your session has expired" (2026-11-19) - and only that.
+        query["expired"] = "1"
+    else:
+        flash(request, LOGIN_MESSAGE, "info")
+    return HttpResponseRedirect("/?" + urlencode(query)), None
 
 
 def home(request: HttpRequest) -> HttpResponse:
     if request.method not in ("GET", "HEAD"):
         return HttpResponseNotAllowed(["GET"])
     if signed_in_user(request) is not None:
-        return HttpResponseRedirect("/entity")
-    return HttpResponseRedirect(hub_login_url(request, next_path=request.GET.get("next")))
+        # Signed in already (again, in another tab): straight on to ``next``, else the list.
+        return HttpResponseRedirect(safe_internal_path(request.GET.get("next")) or "/entity")
+    return HttpResponseRedirect(hub_login_url(request, next_path=request.GET.get("next"),
+                                              expired=request.GET.get("expired") == "1"))
 
 
 def register(request: HttpRequest) -> HttpResponse:

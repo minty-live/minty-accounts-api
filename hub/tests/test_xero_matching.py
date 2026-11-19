@@ -65,8 +65,6 @@ class FakeXero:
              "Status": "ACTIVE"},
         ]
         self.contacts = [{"ContactID": "c-abc", "Name": "ABC Supplies", "ContactStatus": "ACTIVE"}]
-        self.refuse_create: set[str] = set()
-        self.created: list[str] = []
 
     def get(self, url, headers=None, params=None, timeout=None, **_):
         if url.endswith("/Accounts"):
@@ -76,11 +74,7 @@ class FakeXero:
         raise AssertionError(url)
 
     def post(self, url, headers=None, json=None, timeout=None, **_):
-        name = json["Contacts"][0]["Name"]
-        if name in self.refuse_create:
-            return _Resp(400, {"Message": "refused"})
-        self.created.append(name)
-        return _Resp(200, {"Contacts": [{"ContactID": f"c-new-{len(self.created)}", "Name": name}]})
+        raise AssertionError(f"matching wrote to Xero ({url}): connecting creates nothing there (C2)")
 
 
 @pytest.fixture
@@ -260,28 +254,36 @@ def test_finish_combines_accounts_that_each_have_a_bill_code(minty, xero):
 # ---- suppliers ---------------------------------------------------------------------------------------
 
 
-def test_suppliers_are_linked_by_name_else_created_and_a_refusal_keeps_it_disconnected(minty, xero):
+def test_suppliers_are_linked_by_name_and_the_rest_stay_in_minty_and_it_connects(minty, xero):
+    """Connecting creates nothing in Xero (owner's decisions doc C2, 2026-11-19): a supplier with a
+    Xero contact of its name (case and extra spaces ignored) is linked; the others stay in Minty and
+    go to Xero at their first publish. Finish connects the company straight away."""
     entity = minty["entity"]
-    abc = XeroContactSync.objects.create(entity_id=entity.id, name="  abc supplies ", source="user")
+    abc = XeroContactSync.objects.create(entity_id=entity.id, name="  abc   supplies ", source="user")
     new = XeroContactSync.objects.create(entity_id=entity.id, name="Wing Lee Trading Co.", source="user")
-    stuck = XeroContactSync.objects.create(entity_id=entity.id, name="Star Ferry Logistics", source="user")
-    xero.refuse_create = {"Star Ferry Logistics"}
     _match_everything_used(minty)
 
     body = call("post", BASE + "/finish", minty["admin"], entity.id).json()
-    assert (body["connected"], body["failed_contacts"]) == (False, ["Star Ferry Logistics"])
+    assert (body["connected"], body["failed_contacts"]) == (True, [])
     assert XeroContactSync.objects.get(id=abc.id).xero_contact_id == "c-abc", "case and spaces ignored"
-    assert XeroContactSync.objects.get(id=new.id).xero_contact_id.startswith("c-new-")
-    assert Entity.objects.get(id=entity.id).status == "disconnected"
-    page = call("get", "/api/me/company/integration", minty["admin"], entity.id).json()
-    assert page["matching"] == {"accounts": False, "contacts": True, "reason": None}
+    assert XeroContactSync.objects.get(id=new.id).xero_contact_id is None, "stays in Minty"
+    kinds = list(ContactChangeLog.objects.filter(entity_id=entity.id).values_list("kind", flat=True))
+    assert kinds == ["linked"]
+    assert Entity.objects.get(id=entity.id).status == "connected"
 
-    xero.refuse_create = set()
+
+def test_a_company_the_old_rule_left_disconnected_is_connected_by_try_again(minty, xero):
+    """Before 2026-11-19 Finish kept a company disconnected until every supplier was in Xero. Try
+    again (the contacts route) now links by name and connects it, creating nothing."""
+    entity = minty["entity"]
+    stuck = XeroContactSync.objects.create(entity_id=entity.id, name="Star Ferry Logistics", source="user")
+    _match_everything_used(minty)
+    call("post", BASE + "/finish", minty["admin"], entity.id)
+    Entity.objects.filter(id=entity.id).update(status="disconnected")  # as the old rule left it
+
     retry = call("post", BASE + "/contacts", minty["admin"], entity.id).json()
     assert (retry["connected"], retry["failed_contacts"]) == (True, [])
-    assert XeroContactSync.objects.get(id=stuck.id).xero_contact_id
-    kinds = sorted(ContactChangeLog.objects.filter(entity_id=entity.id).values_list("kind", flat=True))
-    assert kinds == ["created_in_xero", "created_in_xero", "linked"]
+    assert XeroContactSync.objects.get(id=stuck.id).xero_contact_id is None
     assert Entity.objects.get(id=entity.id).status == "connected"
 
 
@@ -434,7 +436,7 @@ def test_finishing_a_change_leaves_the_suppliers_alone(connected, xero):
     assert call("post", BASE + "/change", connected["admin"], entity.id).status_code == 200
     resp = call("post", BASE + "/finish", connected["admin"], entity.id)
     assert resp.status_code == 200, resp.content
-    assert resp.json()["connected"] is True and xero.created == []
+    assert resp.json()["connected"] is True  # the fake fails the test on any write to Xero
     assert Entity.objects.get(id=entity.id).status == "connected"
 
 
@@ -499,3 +501,92 @@ def test_each_sales_accounts_code_counts_as_used(minty):
     assert minty["unused"].id not in used_account_ids(entity.id)
     EntityPettycashSettings.objects.filter(entity_id=entity.id).update(electronic_sale_account_id=minty["unused"].id)
     assert minty["unused"].id in used_account_ids(entity.id)
+
+
+# ---- one account mapped again (owner's decisions doc A3, 2026-11-19) --------------------------------
+
+
+def _gone(m, row):
+    """As the sync and the trigger leave an account Xero archived or removed, records still on it."""
+    from minty_db.models import MintyMerge, Report, ReportExpense  # noqa: F401
+
+    account = AccountInfo.objects.get(id=m[row].id)
+    report = Report.objects.create(entity_id=m["entity"].id, transaction_date="2026-11-19")
+    ReportExpense.objects.create(report_id=report.id, account_id=account.id, amount=1)
+    AccountInfo.objects.filter(id=account.id).update(status="ARCHIVED", record_status="archived")
+    return account
+
+
+def test_an_account_gone_from_xero_is_mapped_again_and_nothing_moves(connected):
+    from minty_db.models import MintyMerge, ReportExpense
+
+    entity, admin = connected["entity"], connected["admin"]
+    rent = _gone(connected, "rent")
+    page = call("get", BASE + f"/account?account={rent.id}&entity={entity.id}", admin)
+    assert page.status_code == 200, page.content
+    body = page.json()
+    assert body["gone_from_xero"] is True and body["message"] == matching.GONE_FROM_XERO
+    assert body["row"]["name"] == "Rent" and any(o["name"] == "Cleaning" for o in body["options"])
+
+    resp = call("post", BASE + "/account", admin, entity.id,
+                {"account_id": str(rent.id), "xero_account_id": str(_copy_in("x-clean").id)})
+    assert resp.status_code == 200, resp.content
+    rent.refresh_from_db()
+    assert (rent.xero_account_id, rent.status, rent.record_status, rent.xero_code) == (
+        "x-clean", "ACTIVE", "active", "420")
+    assert ReportExpense.objects.filter(account_id=rent.id).count() == 1, "no records move (A3)"
+    assert not MintyMerge.objects.filter(merged_id=rent.id).exists(), "nothing in the merging table"
+    assert not MintyMerge.objects.filter(kept_id=rent.id).exists()
+
+
+def test_mapping_to_a_xero_account_another_account_holds_says_merge_instead(connected):
+    entity, admin = connected["entity"], connected["admin"]
+    rent = _gone(connected, "rent")
+    holder = AccountInfo.objects.get(entity_id=entity.id, xero_account_id="x-wages", record_status="active")
+    resp = call("post", BASE + "/account", admin, entity.id,
+                {"account_id": str(rent.id), "xero_account_id": str(_copy_in("x-wages").id)})
+    assert resp.status_code == 409
+    assert resp.json() == {"error": f"{holder.name} is already linked to that Xero account. Merge Rent into "
+                                    f"{holder.name} instead.",
+                           "merge_into": {"id": str(holder.id), "name": holder.name}}
+    rent.refresh_from_db()
+    assert rent.xero_account_id == "x-rent", "nothing changed"
+
+
+def test_mapping_needs_the_right_and_one_of_the_companys_xero_accounts(connected):
+    entity = connected["entity"]
+    rent = _gone(connected, "rent")
+    body = {"account_id": str(rent.id), "xero_account_id": str(_copy_in("x-clean").id)}
+    assert call("post", BASE + "/account", connected["cashier"], entity.id, body).status_code == 403
+    import uuid as _uuid
+
+    assert call("post", BASE + "/account", connected["admin"], entity.id,
+                {"account_id": str(rent.id), "xero_account_id": str(_uuid.uuid4())}).status_code == 422
+
+
+# ---- Disconnect while a matching is open (the user, 2026-11-19) -------------------------------------
+
+
+def test_disconnecting_during_the_first_matching_goes_back_to_minty_on_its_own(minty):
+    """A company that never finished its first matching was never connected: Disconnect closes the
+    matching, drops its picks and the organisation - it keeps its books in Minty, as before."""
+    entity, admin = minty["entity"], minty["admin"]
+    assert AccountMatchDraft.objects.filter(entity_id=entity.id).exists()
+    resp = call("post", "/api/me/company/xero/disconnect", admin, entity.id)
+    assert resp.status_code == 200, resp.content
+    entity.refresh_from_db()
+    assert (entity.xero_matching, entity.xero_org_id, entity.setup_mode, entity.status) == (
+        None, None, "minty", "disconnected")
+    assert not AccountMatchDraft.objects.filter(entity_id=entity.id).exists()
+    page = call("get", "/api/me/company/integration", admin, entity.id).json()
+    assert page["matching"] == {"accounts": False, "contacts": False, "reason": None}
+
+
+def test_disconnecting_while_changing_the_matches_keeps_the_organisation(connected):
+    entity, admin = connected["entity"], connected["admin"]
+    assert call("post", BASE + "/change", admin, entity.id).status_code == 200
+    resp = call("post", "/api/me/company/xero/disconnect", admin, entity.id)
+    assert resp.status_code == 200, resp.content
+    entity.refresh_from_db()
+    assert (entity.xero_matching, str(entity.xero_org_id), entity.status) == (None, ORG, "disconnected")
+    assert not AccountMatchDraft.objects.filter(entity_id=entity.id).exists()

@@ -12,6 +12,7 @@ fall-through is gone (2026-11-06), so a path not below is a 404, and Flask is no
 | `/health` | Django: `{"status": "ok", "service": "minty-accounts-api"}`. It never calls Flask |
 | `POST /api/internal/xero/token` | Django (Phase 2): the Xero token service, below |
 | `POST /api/internal/xero/sync` | Django (Phase 3): the one Xero account/contact sync, below |
+| `POST /api/internal/session/touch` | Django (Phase 9, 2026-11-19, `hub/session_store.py`): the other APIs keep a sign-in alive and learn it has ended (410) - sign-out after 60 minutes without activity, authentication.md section 3.3 |
 | `POST /api/handoff/redeem` | Django (gap 4, 2026-11-09, `hub/handoffs.py`): an app's landing swaps its one-time code for its token |
 | `GET /auth/notices`, `GET /legal/current`, `POST /legal/invite-terms-status` | Django (Phase 5A, `hub/public.py`) |
 | `GET /api/me/entities`, `GET/PATCH /api/me/profile`, `GET /api/me/terms`, `POST /api/me/terms/accept`, `POST /api/me/contact` | Django (Phase 5B, `hub/`). Each company row carries `xero_org_name` (2026-11-16, minty-web's Xero badge): `xero_tenant_name` for a `connected` company, else null |
@@ -307,9 +308,9 @@ Everything that used Flask's session cookie, moved in one release (everyone sign
 - **The session** is Django's (`django.contrib.sessions`, table `django_session`, created by hand
   with `manage.py migrate sessions` on each database - the schema file's note B6; the Postgres test
   database gets the same step in the root `conftest.py`). Cookie `session` (Flask's name, so the old
-  cookie is replaced), 24 h, HttpOnly, SameSite=Lax, Secure outside development. There is no
+  cookie is replaced), 60 minutes without activity (Phase 9; it was 24 h), HttpOnly, SameSite=Lax, Secure outside development. There is no
   `django.contrib.auth`: `hub/session.py` keeps the person's id and the sign-in's id (`login_sid`,
-  the module tokens' `sid`); `sign_in` cycles the key (no fixation) and stamps presence, as
+  every hand-off token's `sid`, from which the key is derived); `sign_in` gives a new key (no fixation) and stamps presence, as
   Flask-Login's signal did. Flashed messages wait in the session until a redirect signs them into
   `?flash=` (`hub/notices.sign_notices`, the same itsdangerous format Flask writes).
 - **Headers** (`core/hardening.py`): Flask's `Referrer-Policy`, `nosniff`, `X-Frame-Options`, HSTS
@@ -458,10 +459,13 @@ pointing at nothing.
   logged in `account_change_log` (one batch); drafts deleted; `setup_mode = 'xero'` and
   `xero_publish_from` = today (Hong Kong; the day Finish ran, no longer a publish cut-off: owner 2026-11-18, any record publishes once Xero is connected).
 - **Suppliers** (after the replace commits): each own supplier linked to the Xero contact of its name
-  (case and surrounding spaces ignored; the active one first, else the first by Xero id - the doc's Q9
-  default), else created in Xero under its Minty name; one already stored here is merged into it.
-  Logged in `contact_change_log`. Any Xero refuses are named; the company stays disconnected until
-  `POST .../contacts` gets them all through, then it is `connected` and the first sync starts.
+  (case and extra spaces ignored, `sync._name_key`; the active one first, else the first by Xero id -
+  the doc's Q9 default); one already stored here is merged into it. Logged in `contact_change_log`.
+  **Connecting creates nothing in Xero** (owner's decisions doc C2, 2026-11-19): a supplier with no
+  Xero contact of its name stays in Minty and goes to Xero at its first publish (C1), so Finish
+  connects the company straight away and starts the first sync. `POST .../contacts` (Try again) is
+  left for a company the old rule (before 2026-11-19: disconnected until every supplier was in Xero)
+  still holds disconnected: it links by name and connects it.
 - **The sync never deletes what is used or Minty-made** (also 2026-11-11): `sync.apply_accounts`
   archives a used (or Minty-made) account Xero dropped and leaves rows with no Xero id alone;
   `_mirror_bills` keeps bill codes with no Xero id; the connect's contact clean-up and
@@ -505,8 +509,52 @@ Tests: `hub/tests/test_company_chart.py`.
 **No duplicates from the sync (owner, 2026-11-12; `xero/services/sync.py`).** A Xero account Minty
 doesn't hold yet takes the place of the company's own unlinked account of the same code and type
 (`linked` in the counts); a Xero contact, of the company's own unlinked contact of the same name
-(case and inner spaces ignored) - never a second row beside it. Then, on every live sync and the
-connect's (`connect.background_sync`), the company's contacts made in Minty while offline go to Xero
-(`_push_own_contacts` -> `matching.link_suppliers`: Xero's of the name, else made there); a name
-Xero refuses stays for the next sync, logged. Not while the company still keeps its books in Minty
-or a matching is open - its Finish links them. Tests: `xero/tests/test_sync.py`.
+(case and inner spaces ignored) - never a second row beside it. **The sync only reads** (owner's
+decisions doc C2, 2026-11-19): nothing goes to Xero from any sync, the connect's included - a contact
+made in Minty reaches Xero when it is added while connected (C5) or at its first publish (C1).
+Tests: `xero/tests/test_sync.py`.
+
+**Opening Settings reads at most once every 2 minutes (C2).** `POST /api/internal/xero/sync` with the
+body `{"throttle": true}` (Petty Cash Settings' `refresh_from_xero`) skips the read when the company's
+contacts were read under 2 minutes ago (`sync.read_recently`: the newest `xero_contact.synced_at`,
+which every sync stamps) - 200 `{"accounts": null, "contacts": null, "skipped": true}`. Other callers
+(onboarding's saves, Payment Requests) send no body and always read. The General tab's contact list
+does the same before forwarding: `hub/company_chart.py` reads a connected company's contacts first,
+throttled the same way; Xero failing leaves the stored list, logged. Tests: `xero/tests/test_sync.py`,
+`hub/tests/test_company_chart.py`.
+
+## Merging, relinking and mapping one account (the owner's decisions doc, 2026-11-19)
+
+The doc "Minty Xero Sync & Report Decisions" (claude.ai artifact HV37p5LpnzconZBJEUD31n) sets these.
+
+- **The one merge (M1-M4), `xero/services/merge.py`.** `combine_accounts` / `combine_contacts` move
+  every record of the merged one to the kept one (expenses, bill lines - and, for a Settings merge,
+  their `account_code` - bills, daily closing's slots, `account_module`, `entity_account_xero`; a
+  Settings merge also takes the merged account's bill code off Payment Settings), archive it with
+  `merged_into_id` and write `minty_merge` plus a `minty_merge_record` per moved row (minty-db v0.14)
+  besides the change logs. No new record, Xero not touched, no undo. Matching's Finish runs them
+  (`_combine`, `_merge_supplier`; reason `xero_matching`).
+- **Settings Merge**: `POST /api/me/company/{accounts|contacts}/<id>/merge {"into"}` (`hub/company_chart.py`,
+  handled here, not forwarded; `COA_DELETE`) -> `merge_accounts` / `merge_contacts`: same company, both
+  active, the kept one never merged away; accounts of one class only and never a daily-closing system
+  account merged away (the user's additions, 2026-11-19). 200 `{message, moved}`.
+- **The sync keeps merged rows**: `apply_accounts` never touches a row with `merged_into_id` (it used to
+  delete a merged-away Xero account Xero dropped, and its log with it).
+- **A contact archived in Xero (C4)**: `POST /api/internal/xero/contacts/<id>/relink {xero_contact_id,
+  reason}` (assertion scope `xero-contact-relink`; `merge.relink_contact`) - Petty Cash's and Payment
+  Requests' publish follow Xero's merge (`merged_in_xero`, no prompt) and their "map it now" (`user`). The
+  Xero contact already a different Minty contact: the two are merged (the user's rule). A contact the
+  company deleted holding it: 409.
+- **One account mapped again (A3)**: `GET /api/me/company/xero/matching/account?account=<id>` (the row and
+  the Xero accounts of its kind) and `POST {account_id, xero_account_id}` (`XERO_SETTINGS_UPDATE`;
+  `matching.read_one` / `map_one`, through `_link`: Xero's code, name and type; no records move, nothing
+  in the merging table). Another active account holding that Xero account: 409 `{error, merge_into}` -
+  merge instead (the user's rule). `matching.GONE_FROM_XERO` is the doc's sentence.
+- Tests: `hub/tests/test_company_merge.py`, `hub/tests/test_xero_matching.py` (A3).
+
+**Disconnect while a matching is open (the user, 2026-11-19).** `POST /api/me/company/xero/disconnect`
+(`disconnect.disconnect_entity_from_xero`) closes an open matching and drops its unsaved picks
+(`account_match_draft`). A company that never finished its FIRST matching (`setup_mode` still `minty`)
+was never connected, so its organisation goes too: it keeps its books in Minty, as before it signed in
+to Xero. A connected company (changing its matches, or a new organisation or accounts) keeps its
+organisation, as every disconnect does. Tests: `hub/tests/test_xero_matching.py`.

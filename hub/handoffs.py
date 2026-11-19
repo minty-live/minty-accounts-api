@@ -3,8 +3,10 @@ onboarding launch), ``auth/routes/logout.py`` and ``leave_entity.py`` (Phase 6 o
 retirement, 2026-11-06).
 
 **Tokens** (HS256 over ``SECRET_KEY``, Flask's claims exactly): the module token (30 min,
-``module: "billing"``) every app's ``/landing`` keeps, and the onboarding token (60 min,
-``scope: "onboarding"``).
+``module: "billing"``) every app's ``/landing`` keeps, and the onboarding token (30 min,
+``scope: "onboarding"``). Both carry ``sid``, the sign-in they came from (Phase 9): every API asks
+``/api/internal/session/touch`` about it (``hub/session_store.py``), so the apps end with the hub
+session - signed out, or 60 minutes without activity.
 
 **No token in an address (gap 4, 2026-11-09):** an app is handed a one-time ``code`` - the token
 parked for 2 minutes (``hub/parked.py``, like the code sign-in's hand-off) - which its landing
@@ -67,7 +69,7 @@ logger = logging.getLogger("minty-accounts-api")
 
 MODULE_TOKEN_MINUTES = 30
 MODULE_TOKEN_CLAIM = "billing"
-ONBOARDING_TOKEN_MINUTES = 60
+ONBOARDING_TOKEN_MINUTES = 30  # every app the same (owner, 2026-11-19): 30 min, renewed; 60 min idle
 MODULE_BILL = "PAYMENT_REQUEST"
 MODULE_PETTY_CASH = "PETTY_CASH"
 MINTY_WEB_ENTITIES_PATH = "/entities"
@@ -100,9 +102,9 @@ def module_token(request: HttpRequest | None, user_id, entity_id, xero_org_id, r
     return jwt.encode(payload, settings.SECRET_KEY, algorithm="HS256")
 
 
-def onboarding_token(user_id) -> str:
+def onboarding_token(user_id, sid: str = "") -> str:
     now = datetime.now(UTC)
-    return jwt.encode({"user_id": str(user_id), "scope": "onboarding", "iat": now,
+    return jwt.encode({"user_id": str(user_id), "scope": "onboarding", "sid": sid or "", "iat": now,
                        "exp": now + timedelta(minutes=ONBOARDING_TOKEN_MINUTES)}, settings.SECRET_KEY, algorithm="HS256")
 
 
@@ -211,7 +213,7 @@ def payment_request_landing_url(request: HttpRequest, org: Entity, user: User, p
 def onboarding_launch_url(request: HttpRequest, user: User, *, entity_name: str = "", entity_id: str = "",
                           fresh: bool = False) -> str:
     origin = handoff_origin(request, "onboarding", settings.ONBOARDING_WEB_URL)
-    params = {"code": park_token(onboarding_token(user.id), origin), "first": (user.first_name or "").strip(),
+    params = {"code": park_token(onboarding_token(user.id, login_sid(request) or ""), origin), "first": (user.first_name or "").strip(),
               "last": (user.last_name or "").strip(), "entity_name": entity_name, "entity_id": str(entity_id or ""),
               "fresh": "1" if fresh and not entity_id else ""}
     query = urlencode({k: v for k, v in params.items() if v})
