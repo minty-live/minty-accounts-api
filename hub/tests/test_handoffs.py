@@ -143,9 +143,10 @@ def test_a_company_you_cannot_see_gets_no_token(shop, which):
 
 def test_petty_cash_switched_off_gets_no_token_and_onboarding_goes_to_the_wizard(shop):
     shop["modules"]()
-    client = login(Client(), shop["owner"])
+    client = login(Client(), cashier(shop))
     assert client.get("/handoff/petty-cash-web", {"entity_id": str(shop["entity"].id)})["Location"] == "/entity"
     Entity.objects.filter(id=shop["entity"].id).update(status="onboarding")
+    client = login(Client(), shop["owner"])
     wizard = urlsplit(client.get("/handoff/petty-cash-web", {"entity_id": str(shop["entity"].id)})["Location"])
     assert f"{wizard.scheme}://{wizard.netloc}" == ONB
     query = parse_qs(wizard.query)
@@ -234,6 +235,52 @@ def test_the_payment_request_hand_off_and_its_request_segment(shop):
     assert query["next"] == [f"{path}/payment-request/PR-0001%2FA"]
     plain = landing(client.get(f"{path}/payment-request", {"request": "../x"}), PAY)
     assert plain["next"] == [f"{path}/payment-request"]
+
+
+def cashier(shop):
+    """A member below accountant: the subscriptions list does not show them the company."""
+    user = make_user("cashier@test.com")
+    UserEntity.objects.create(user_id=user.id, entity_id=shop["entity"].id, role="cashier", approved=True)
+    return user
+
+
+def subscriptions_row(resp, shop):
+    """minty-web's Manage Subscriptions with this company's row open (``?entity=``)."""
+    query = landing(resp, HUB)
+    assert query["next"] == [f"/subscription/subscriptions?entity={shop['entity'].id}"]
+    assert claims(query)["entity_id"] == str(shop["entity"].id)
+
+
+def test_a_module_switched_off_opens_the_companys_row_in_manage_subscriptions(shop):
+    """Owner, 2026-11-19: an expired (or never started) module sends someone who can see the
+    company's subscription to its row there, not back to the list with a warning."""
+    shop["modules"]()
+    client = login(Client(), shop["owner"])
+    path = f"/entity/{ref(shop['entity'])}"
+    subscriptions_row(client.get(f"{path}/petty-cash"), shop)
+    via = client.get(f"{path}/modules")["Location"]  # both off: on to petty-cash, which opens the row
+    assert via == iri(f"{path}/petty-cash")
+    subscriptions_row(client.get(via), shop)
+    subscriptions_row(client.get("/handoff/petty-cash-web", {"entity_id": str(shop["entity"].id)}), shop)
+    shop["modules"]("PETTY_CASH")
+    subscriptions_row(client.get(f"{path}/payment-request"), shop)
+
+
+def test_a_module_switched_off_keeps_the_warning_below_accountant(shop):
+    shop["modules"]()
+    client = login(Client(), cashier(shop))
+    path = f"/entity/{ref(shop['entity'])}"
+    for resp in (client.get(f"{path}/petty-cash"),
+                 client.get("/handoff/petty-cash-web", {"entity_id": str(shop["entity"].id)})):
+        assert resp["Location"] == "/entity"
+    shop["modules"]("PETTY_CASH")
+    assert client.get(f"{path}/payment-request")["Location"] == iri(f"{path}/petty-cash")
+
+
+def test_a_module_switched_off_gives_a_stranger_nothing(shop):
+    shop["modules"]()
+    resp = login(Client(), shop["stranger"]).get(f"/entity/{ref(shop['entity'])}/petty-cash")
+    assert resp["Location"] == "/entity" and "code=" not in resp["Location"]
 
 
 def test_the_dashboard_hands_over_to_the_apps_petty_cash(shop):

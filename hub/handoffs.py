@@ -29,6 +29,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from urllib.parse import quote, urlencode, urlsplit
 
@@ -70,6 +71,7 @@ ONBOARDING_TOKEN_MINUTES = 60
 MODULE_BILL = "PAYMENT_REQUEST"
 MODULE_PETTY_CASH = "PETTY_CASH"
 MINTY_WEB_ENTITIES_PATH = "/entities"
+MINTY_WEB_SUBSCRIPTIONS_PATH = "/subscription/subscriptions"
 REQUEST_REFERENCE_MAX = 255
 NO_PERMISSION = "Hmm, it looks like you don't have permission to look there."
 NOT_FOUND = "Hmm, I looked everywhere but couldn't find that one."
@@ -222,6 +224,18 @@ def _to_list(request: HttpRequest, message: str | None = None, category: str = "
     return HttpResponseRedirect("/entity")
 
 
+def _module_off(request: HttpRequest, user: User, entity_id, otherwise: Callable[[], HttpResponse]) -> HttpResponse:
+    """A module switched off (expired, cancelled, never started): someone who can see the company's
+    subscription (accountant and up - the list's own rule) lands on its row in minty-web's Manage
+    Subscriptions (``?entity=`` opens it; owner, 2026-11-19); anyone else gets ``otherwise()`` (called
+    only then, so its warning is never flashed for a redirect)."""
+    org = _entity(entity_id)
+    if org is None or not has_permission(user, Permission.SUBSCRIPTION_VIEW, str(org.id)):
+        return otherwise()
+    return HttpResponseRedirect(minty_web_landing_url(
+        request, f"{MINTY_WEB_SUBSCRIPTIONS_PATH}?{urlencode({'entity': str(org.id)})}", org, user))
+
+
 def _get_only(request: HttpRequest) -> HttpResponse | None:
     return None if request.method in ("GET", "HEAD") else HttpResponseNotAllowed(["GET"])
 
@@ -266,7 +280,8 @@ def report_dashboard(request: HttpRequest, entity_id) -> HttpResponse:
     if early is not None:
         return early
     if not module_enabled(entity_id, MODULE_PETTY_CASH):
-        return _to_list(request, "Petty Cash is not activated for this entity.", "warning")
+        return _module_off(request, user, entity_id,
+                           lambda: _to_list(request, "Petty Cash is not activated for this entity.", "warning"))
     if not is_superuser(user) and not UserEntity.objects.filter(user_id=user.id).exists():
         return _to_list(request, "You'll need to create an entity before I can show you the report dashboard.", "info")
     if _entity(entity_id) is None:
@@ -328,6 +343,8 @@ def go_to_payment_requests(request: HttpRequest, entity_id) -> HttpResponse:
     if not is_superuser(user) and not UserEntity.objects.filter(user_id=user.id, entity_id=org.id).exists():
         return _to_list(request, NO_PERMISSION)
     if not module_enabled(org.id, MODULE_BILL):
+        if has_permission(user, Permission.SUBSCRIPTION_VIEW, str(org.id)):
+            return _module_off(request, user, org.id, lambda: HttpResponseRedirect(company_path(org.id, "petty-cash")))
         flash(request, "The Payment module isn't switched on for this entity yet - an admin can turn it on in the "
                        "entity's module settings.", "warning")
         return HttpResponseRedirect(company_path(org.id, "petty-cash"))
@@ -371,8 +388,9 @@ def handoff_petty_cash_web(request: HttpRequest) -> HttpResponse:
     if org.status == "onboarding":
         return HttpResponseRedirect(onboarding_launch_url(request, user, entity_name=org.name or "", entity_id=org.id))
     if not module_enabled(org.id, MODULE_PETTY_CASH):
-        return _to_list(request, "Petty Cash isn't switched on for this company yet - an admin can turn it on in the "
-                                 "company's modules.", "warning")
+        return _module_off(request, user, org.id, lambda: _to_list(
+            request, "Petty Cash isn't switched on for this company yet - an admin can turn it on in the "
+                     "company's modules.", "warning"))
     destination = safe_next(request.GET.get("next"), minty_web_company_path(org.id, "/petty-cash"))
     token = module_token(request, user.id, org.id, org.xero_org_id, _role(user, org.id),
                          module_enabled(org.id, MODULE_BILL), True)

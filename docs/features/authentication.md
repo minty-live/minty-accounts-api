@@ -205,7 +205,12 @@ The short id decides; the name is only for reading (`hub/addresses.py`):
   | `/entity/<co>/enter`, `/xero-not-connected` | the return from an app; the integration tab |
 
   `hub/handoffs.py` and `hub/redirects.py` keep Flask's guards: signed in, a member (or
-  superuser), the tab's permission, the module switched on. `/payment-request?request=<id>` lands
+  superuser), the tab's permission, the module switched on. **A module switched off** (expired,
+  cancelled, never started) on `/petty-cash`, `/payment-request` or `/handoff/petty-cash-web`
+  sends anyone who can see the company's subscription (accountant and up, `SUBSCRIPTION_VIEW`,
+  the list's own rule) to minty-web's Manage Subscriptions with that company's row open
+  (`/subscription/subscriptions?entity=<id>`, `_module_off`; owner, 2026-11-19); below
+  accountant it is still the warning back to the list. `/payment-request?request=<id>` lands
   on one request: a uuid, or its Payment No. as plain text, kept only when 1-255 characters with
   no control character, no backslash and no empty/`.`/`..` piece between slashes
   (`_request_segment`; anything else lands on the list), quoted into ONE path segment.
