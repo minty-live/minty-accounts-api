@@ -262,8 +262,8 @@ the step or form open at that moment is lost.
   This service's hub door (`hub/transport.bearer_claims`) touches directly, same cache, no HTTP.
 - **A token with no `sid`** (minted before Phase 9, or by hand) passes until it expires - no mass
   sign-out at release. **accounts-api unreachable**, or any answer but 200/410 (a 404 from an
-  accounts-api without the route included), is logged at ERROR and the token honoured (it is still
-  a signed, unexpired credential), then asked about again a minute later.
+  accounts-api without the route included), is logged at ERROR; (minty-shared v0.9, owner 2026-11-19: "short grace, then refuse") the token is honoured only while that sign-in was confirmed alive in the last 5 minutes, then the request is refused 503 "Minty can't check your sign-in just now. Try again in a minute." (`SessionCheckUnavailableError`) - nobody is signed out by an outage, and a sign-in known to have ended stays ended. This service's own
+  door asks its own store, so it never meets an unreachable accounts-api.
 - **"Your session has expired" (owner, 2026-11-19).** The two 401s are told apart on the server:
   `minty_shared.tokens.session_ended(token, ACCOUNTS_API_URL, SECRET_KEY)` is True when the
   token's signature verifies (its expiry ignored, for this question only) and its `sid`'s sign-in
