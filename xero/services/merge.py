@@ -180,6 +180,15 @@ def _active(model, entity_id, record_id):
                                 merged_into__isnull=True).first()
 
 
+def _gone_from_xero(entity_id, record_id):
+    """A linked account Xero archived or removed: archived here only because Xero's status says so
+    (the sync sets ``status``, a trigger ``record_status``), never merged away. It may be merged into
+    an account Xero has - A3's "merge instead" (2026-11-20) - but is never the one kept."""
+    return (AccountInfo.objects.filter(entity_id=entity_id, id=record_id, record_status="archived",
+                                       merged_into__isnull=True, xero_account_id__isnull=False)
+            .exclude(status="ACTIVE").first())
+
+
 def merge_accounts(entity_id, merged_id, kept_id, user_id) -> dict:
     """``merged_id``'s records moved to ``kept_id`` (M1-M4). Raises ``Refused``."""
     if str(merged_id) == str(kept_id):
@@ -192,7 +201,8 @@ def merge_accounts(entity_id, merged_id, kept_id, user_id) -> dict:
             raise Refused(NOT_FOUND.format(kind="account"), 404)
         if kept.merged_into_id is not None:
             raise Refused(MERGED_AWAY.format(name=kept.name, kind="account"))
-        if _active(AccountInfo, entity_id, merged.id) is None or _active(AccountInfo, entity_id, kept.id) is None:
+        mergeable = _active(AccountInfo, entity_id, merged.id) or _gone_from_xero(entity_id, merged.id)
+        if mergeable is None or _active(AccountInfo, entity_id, kept.id) is None:
             raise Refused(NOT_FOUND.format(kind="account"), 404)
         if merged.is_system:
             raise Refused(SYSTEM.format(name=merged.name))

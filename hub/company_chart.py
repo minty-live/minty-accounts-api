@@ -2,7 +2,8 @@
 accounts and contacts in the hub's Settings (owner, 2026-11-12).
 
 minty-onboarding-api holds the one implementation (the owner's choice that day): its account rules
-and side effects, the Xero writes, who owns what. This is the hub's door to it - the person's
+and side effects, who owns what, and the one Xero write left - a contact added while live, linked
+or made there as a supplier (the owner's decisions doc C5; Minty never creates an account in Xero, A1). This is the hub's door to it - the person's
 token, the company from ``?entity=``, the permission - then the call, as an internal one carrying
 a short-lived service assertion (scope ``company-chart``) that names the company and the person.
 Its answer and status come back as they are; onboarding-api checks the person's rights again.

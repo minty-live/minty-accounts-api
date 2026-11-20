@@ -102,6 +102,42 @@ def test_a_merge_needs_the_right_two_accounts(shop):
     assert MintyMerge.objects.filter(entity_id=entity.id).count() == 1
 
 
+def test_an_account_xero_archived_can_be_merged_away_but_never_kept(shop):
+    """A3's "merge instead" (2026-11-20): a used account whose Xero account was archived is archived
+    here too (the sync sets its status, a trigger its record status) - it can still be merged into
+    an account Xero has, and its records move; it can't be the one kept."""
+    entity = shop["entity"]
+    gone = account(entity, "Taxi", "471", xero_account_id="x-taxi")
+    transport = account(entity, "Transport", "470", xero_account_id="x-transport")
+    expenses(entity, gone, 3)
+    AccountInfo.objects.filter(id=gone.id).update(status="ARCHIVED")
+    gone.refresh_from_db()
+    assert gone.record_status == "archived", "the trigger follows Xero's status"
+
+    kept_gone = call("post", f"{ACCOUNTS}/{transport.id}/merge", shop["accountant"], entity.id,
+                     {"into": str(gone.id)})
+    assert kept_gone.status_code == 404, "an account Xero archived is never the one kept"
+
+    resp = call("post", f"{ACCOUNTS}/{gone.id}/merge", shop["accountant"], entity.id, {"into": str(transport.id)})
+
+    assert resp.status_code == 200, resp.content
+    assert ReportExpense.objects.filter(account_id=transport.id).count() == 3
+    gone.refresh_from_db()
+    assert (gone.record_status, gone.merged_into_id) == ("archived", transport.id)
+    again = call("post", f"{ACCOUNTS}/{gone.id}/merge", shop["accountant"], entity.id, {"into": str(transport.id)})
+    assert again.status_code == 404, "merged away once: gone for good"
+
+
+def test_an_account_archived_in_minty_is_still_not_mergeable(shop):
+    entity = shop["entity"]
+    old, transport = account(entity, "Old", "472"), account(entity, "Transport", "470")
+    AccountInfo.objects.filter(id=old.id).update(record_status="archived")
+
+    resp = call("post", f"{ACCOUNTS}/{old.id}/merge", shop["accountant"], entity.id, {"into": str(transport.id)})
+
+    assert resp.status_code == 404
+
+
 def test_merging_contacts_moves_expenses_bills_and_daily_closings(shop):
     entity = shop["entity"]
     kee = XeroContactSync.objects.create(entity_id=entity.id, name="Kee Wah", source="user")
