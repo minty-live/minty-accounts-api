@@ -5,6 +5,7 @@ grants and use, and give a company a grant - a top-up, or a size other than the 
     GET  /api/me/ai/companies/<id>            one company: its grants, its last reads
     GET  /api/me/ai/companies/<id>/reads?before=<read id>  the next older reads ("Show more")
     POST /api/me/ai/companies/<id>/grants     {tokens?, reads?, days?, note?} -> the company again
+    POST /api/me/ai/companies/<id>/grants/<grant id>/end   end that grant now -> the company again
 
 The allowance itself is minty-db's ``ai_policy``/``ai_grant``/``ai_read`` through
 ``minty_shared.django.ai_allowance`` - the same code the two readers (minty-petty-cash-api,
@@ -20,6 +21,7 @@ import logging
 import uuid
 from datetime import UTC, datetime
 
+from django.db import transaction
 from django.db.models import Count, Max, Q, Subquery
 from django.http import HttpRequest, HttpResponse
 from django.utils import timezone
@@ -42,6 +44,8 @@ MAX_NOTE = 255
 ONLY_SUPPORT = "Only Minty support can manage AI allowances."
 NOT_FOUND = "I couldn't find that company."
 READ_NOT_FOUND = "I couldn't find that read. Close the company and open it again."
+GRANT_NOT_FOUND = "I couldn't find that grant."
+GRANT_ENDED = "This grant has already ended."
 READS_PAGE = 20
 NO_POLICY = ("The AI settings are missing or can't be used, so AI reading is off. "
              "Check ai_policy with manage.py ai_policy.")
@@ -170,6 +174,8 @@ def _detail(entity: Entity, policy: ai_allowance.Policy) -> dict:
             "granted_by": g.granted_by,
             "note": g.note,
             "created_at": _iso(g.created_at),
+            "ended_at": _iso(g.ended_at),
+            "ended_by": g.ended_by,
         })
     reads, more = _reads(entity.id)
     spec = policy.default_grant
@@ -300,3 +306,34 @@ def ai_company_grants(request: HttpRequest, entity_id: str) -> HttpResponse:
     logger.info("AI grant given entity=%s grant=%s actor=%s tokens=%s reads=%s days=%s", entity.id, grant_id,
                 user.id, spec.tokens, spec.reads, spec.days)
     return respond(request, {**_detail(entity, policy), "message": f"Grant given to {entity.name}."}, 201)
+
+
+def ai_company_grant_end(request: HttpRequest, entity_id: str, grant_id: str) -> HttpResponse:
+    """``POST /api/me/ai/companies/<id>/grants/<grant id>/end`` (owner, 2026-11-20): end that grant
+    of THIS company now - its unused tokens and reads can't be used anymore. It sets ``expires_at``
+    (what the allowance counts by) and ``ended_at``/``ended_by`` (the superuser's email) together;
+    the grant stays in the list, so the one-time default grant never comes back. 404 for another
+    company's grant, 409 when it has already ended or expired. Answers the company as the GET does."""
+    early, user = _superuser(request, ("POST",))
+    if early is not None:
+        return early
+    entity = _company(entity_id)
+    if entity is None:
+        return refuse(request, NOT_FOUND, 404)
+    policy = ai_allowance.load_policy()
+    if policy is None:
+        return refuse(request, NO_POLICY, 503)
+    try:
+        grant_uuid = uuid.UUID(str(grant_id))
+    except ValueError:
+        return refuse(request, GRANT_NOT_FOUND, 404)
+    now = timezone.now()
+    with transaction.atomic():
+        grant = AiGrant.objects.select_for_update().filter(id=grant_uuid, entity_id=entity.id).first()
+        if grant is None:
+            return refuse(request, GRANT_NOT_FOUND, 404)
+        if grant.ended_at is not None or (grant.expires_at is not None and grant.expires_at <= now):
+            return refuse(request, GRANT_ENDED, 409)
+        AiGrant.objects.filter(id=grant.id).update(expires_at=now, ended_at=now, ended_by=user.email)
+    logger.info("AI grant ended entity=%s grant=%s actor=%s", entity.id, grant.id, user.id)
+    return respond(request, {**_detail(entity, policy), "message": "Grant ended."})

@@ -9,6 +9,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from minty_db.models import AiGrant, AiPolicy, AiRead, Entity
+from minty_shared.django import ai_allowance
 
 from hub.tests.test_archive import archive, superuser
 from hub.tests.test_company import call
@@ -222,3 +223,69 @@ def test_a_grant_the_form_should_have_caught_is_refused_per_field(shop, policy, 
 def test_only_post_gives(shop, policy):
     assert call("put", grants(shop["entity"].id), superuser(), body={"tokens": 5}).status_code == 405
     assert Entity.objects.count() == 2 and not AiGrant.objects.exists()
+
+
+# ---- ending a grant (owner, 2026-11-20) ----------------------------------------------------------
+
+
+def end(entity_id, grant_id):
+    return f"/api/me/ai/companies/{entity_id}/grants/{grant_id}/end"
+
+
+def test_a_superuser_ends_a_grant_and_it_stops_counting_at_once(shop, policy):
+    grant = AiGrant.objects.create(entity_id=shop["entity"].id, tokens_total=50000, source="manual",
+                                   granted_by="boss@test.com")
+    boss = superuser()
+
+    resp = call("post", end(shop["entity"].id, grant.id), boss)
+
+    assert resp.status_code == 200, resp.content
+    body = resp.json()
+    assert body["message"] == "Grant ended."
+    [shown] = body["grants"]
+    assert shown["open"] is False and shown["ended_by"] == boss.email and shown["ended_at"]
+    assert shown["expires_at"] == shown["ended_at"]
+    assert body["allowance"]["blocked"] is True and body["allowance"]["percent_left"] == 0
+    grant.refresh_from_db()
+    assert grant.ended_by == boss.email and grant.ended_at == grant.expires_at
+
+
+def test_an_ended_grant_still_keeps_the_default_from_coming_back(shop, policy):
+    first = AiGrant.objects.create(entity_id=shop["entity"].id, tokens_total=20000, source="default",
+                                   granted_by="ai_policy")
+    call("post", end(shop["entity"].id, first.id), superuser())
+
+    allowance = ai_allowance.status(shop["entity"].id, ai_allowance.load_policy())
+
+    assert allowance.blocked is True  # no fresh default grant: it is given once, ever
+    assert AiGrant.objects.filter(entity_id=shop["entity"].id).count() == 1
+
+
+def test_a_grant_already_ended_or_expired_is_not_ended_again(shop, policy):
+    boss = superuser()
+    grant = AiGrant.objects.create(entity_id=shop["entity"].id, tokens_total=5000, source="manual")
+    assert call("post", end(shop["entity"].id, grant.id), boss).status_code == 200
+    again = call("post", end(shop["entity"].id, grant.id), boss)
+    assert again.status_code == 409 and again.json() == {"error": "This grant has already ended."}
+
+    expired = AiGrant.objects.create(entity_id=shop["entity"].id, tokens_total=5000, source="manual",
+                                     expires_at=datetime.now(UTC) - timedelta(days=1))
+    assert call("post", end(shop["entity"].id, expired.id), boss).status_code == 409
+
+
+@pytest.mark.parametrize("which", ["unknown", "not-a-uuid", "other"])
+def test_only_a_grant_of_that_company_is_ended(shop, policy, which):
+    grant_id = {"unknown": "6d8f2c9a-0000-4000-8000-000000000000", "not-a-uuid": "x"}.get(which)
+    if which == "other":
+        grant_id = AiGrant.objects.create(entity_id=shop["other"].id, tokens_total=5000, source="manual").id
+    resp = call("post", end(shop["entity"].id, grant_id), superuser())
+    assert resp.status_code == 404 and resp.json() == {"error": "I couldn't find that grant."}
+
+
+@pytest.mark.parametrize("who", ["admin", "accountant", "cashier"])
+def test_only_a_superuser_ends_a_grant(shop, policy, who):
+    grant = AiGrant.objects.create(entity_id=shop["entity"].id, tokens_total=5000, source="manual")
+    assert call("post", end(shop["entity"].id, grant.id), shop[who]).status_code == 403
+    assert call("get", end(shop["entity"].id, grant.id), superuser()).status_code == 405
+    grant.refresh_from_db()
+    assert grant.ended_at is None
