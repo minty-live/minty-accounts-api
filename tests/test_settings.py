@@ -38,10 +38,30 @@ def test_a_missing_required_value_stops_the_start(missing, tmp_path):
     assert f"{missing} is required and is not set" in result.stderr
 
 
-def test_debug_is_off_unless_asked_for():
-    from django.conf import settings
-
-    assert settings.DEBUG is (os.environ.get("DJANGO_DEBUG") == "1")
+@pytest.mark.parametrize("app_env, expected", [
+    ("development", True), ("Development ", True), ("production", False), ("", False), (None, False),
+])
+def test_debug_and_the_draft_banner_follow_app_env_alone(app_env, expected, tmp_path):
+    """Owner, 2026-11-20: APP_ENV=development is the one switch for debug and every
+    development-only feature (the draft banner here); anything else is production. The old
+    DJANGO_DEBUG and LEGAL_SHOW_DRAFT_BANNER are ignored."""
+    env = {k: v for k, v in os.environ.items() if k not in REQUIRED and k != "APP_ENV"}
+    env.update(REQUIRED)
+    if app_env is not None:
+        env["APP_ENV"] = app_env
+    env.update({"DJANGO_DEBUG": "1" if not expected else "0", "LEGAL_SHOW_DRAFT_BANNER": "1" if not expected else "0"})
+    env["DJANGO_SETTINGS_MODULE"] = "config.settings"
+    env["PYTHONPATH"] = str(ROOT)
+    code = (
+        "import dotenv; dotenv.load_dotenv = lambda *a, **k: False\n"
+        "import django; django.setup()\n"
+        "from django.conf import settings\n"
+        "from hub import registry\n"
+        "print(settings.DEBUG, registry.SHOW_DRAFT_BANNER)"
+    )
+    result = subprocess.run([sys.executable, "-c", code], env=env, cwd=tmp_path, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.split() == [str(expected), str(expected)]
 
 
 def test_gunicorn_never_writes_its_access_line():

@@ -56,6 +56,8 @@ import logging
 import os
 from dataclasses import dataclass
 
+from minty_shared.config import is_development
+
 logger = logging.getLogger("minty-accounts-api")
 
 TERMS = "terms"
@@ -75,20 +77,13 @@ CURRENT_TERMS_VERSION = os.environ.get("CURRENT_TERMS_VERSION", "beta-1")
 CURRENT_PRIVACY_VERSION = os.environ.get("CURRENT_PRIVACY_VERSION", "beta-1")
 
 # Whether an unpinned (draft) document shows its "this wording is not final"
-# banner on the acceptance panel.
-#
-# DEFAULTS TO ON, and should stay on anywhere real people are asked to agree.
-# The opt-out exists so a draft can be hidden for demos and screenshots without
-# PINNING the hash, which would assert the wording is final. terms/beta-1 is
-# pinned since 2026-09-18 and no longer shows the banner; privacy/beta-1 is
-# still a placeholder draft and does.
-#
-# Because it defaults to on, an environment that simply does not set it — a
-# fresh production deploy, say — still warns. Hiding the banner has to be a
-# deliberate act, recorded in that environment's config.
-SHOW_DRAFT_BANNER = os.environ.get(
-    "LEGAL_SHOW_DRAFT_BANNER", "1"
-).strip().lower() not in {"0", "false", "no", "off"}
+# banner on the acceptance panel: in development only. APP_ENV=development is
+# the one switch for every development-only feature (owner, 2026-11-20; it
+# replaced LEGAL_SHOW_DRAFT_BANNER), so production never shows it. terms/beta-1
+# is pinned since 2026-09-18 and shows no banner anywhere; privacy/beta-1 is
+# still a placeholder draft. minty-web's /terms and /privacy pages follow the
+# same rule (lib/legal/registry.server.ts).
+SHOW_DRAFT_BANNER = is_development()
 
 # Whether sign-up REFUSES to create an account without agreement.
 #

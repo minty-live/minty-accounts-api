@@ -29,7 +29,6 @@ waits 2 s).
 | `XERO_CLIENT_ID`, `XERO_CLIENT_SECRET` | yes | Xero's OAuth client, Flask's same app |
 | `XERO_API_BASE_URL` | no (`https://api.xero.com/api.xro/2.0`) | Xero's accounting API |
 | `ALLOWED_HOSTS` | no (`*`) | Comma-separated |
-| `DJANGO_DEBUG` | no | `1` turns Django's debug on; never from `APP_ENV` |
 | `LOG_LEVEL` | no (`INFO`) | |
 
 The service refuses to start without any required value.

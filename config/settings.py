@@ -30,9 +30,10 @@ DEVELOPMENT = is_development()
 # The same key as Flask and the other three APIs (they verify each other's tokens); Phase 1
 # signs nothing, but the service refuses to start without the key it will need.
 SECRET_KEY = _required("SECRET_KEY")
-# Never from APP_ENV: a development service runs on production's data until the launch, and
-# Django's debug pages print tracebacks and settings.
-DEBUG = os.environ.get("DJANGO_DEBUG") == "1"
+# APP_ENV=development is the one switch for debug and every development-only feature (owner,
+# 2026-11-20; it replaced DJANGO_DEBUG), as in the other four APIs: the dev-* servers show Django's
+# debug pages, production never does.
+DEBUG = DEVELOPMENT
 ALLOWED_HOSTS = [h.strip() for h in os.environ.get("ALLOWED_HOSTS", "*").split(",") if h.strip()]
 
 #: Xero's OAuth client (the same app Flask signs in with). The token service refreshes with it:
