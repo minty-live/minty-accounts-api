@@ -444,6 +444,28 @@ def _cash_and_bank(entity_id) -> set:
     return {v for v in (row or {}).values() if v}
 
 
+#: Daily closing's contacts, in the Settings card's order, by the key the web names each one with.
+PETTYCASH_CONTACTS = (
+    ("cash_sale", "cash_sale_contact_id"),
+    ("director", "director_contact_id"),
+    ("discrepancy", "discrepancy_contact_id"),
+)
+
+
+def pettycash_contacts_missing(entity_id) -> list[str]:
+    """The daily-closing contacts not chosen yet. Minty's own books need none, Xero's need all three
+    (petty-cash-api ``xero_settings.PETTYCASH_SLOTS``), so after Finish Publish would refuse without
+    them (production, 2026-11-23). A company banking every sale needs no cash-sale contact; one that
+    never set daily closing up has its own Setup Required gate."""
+    row = EntityPettycashSettings.objects.filter(entity_id=entity_id).values(
+        *(column for _, column in PETTYCASH_CONTACTS)).first()
+    if row is None:
+        return []
+    banks_all = Entity.objects.filter(id=entity_id, uses_sales_cash=False).exists()
+    return [key for key, column in PETTYCASH_CONTACTS
+            if not row[column] and not (key == "cash_sale" and banks_all)]
+
+
 def _shares_cash_and_bank(entity_id, drafts: dict) -> bool:
     pair = _cash_and_bank(entity_id)
     picked = [drafts[a].xero_account_id for a in pair if a in drafts]

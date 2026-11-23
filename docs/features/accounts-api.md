@@ -466,6 +466,13 @@ pointing at nothing.
   connects the company straight away and starts the first sync. `POST .../contacts` (Try again) is
   left for a company the old rule (before 2026-11-19: disconnected until every supplier was in Xero)
   still holds disconnected: it links by name and connects it.
+- **Daily closing's contacts** (production, 2026-11-23): Minty's own books need none, Xero's need three
+  (petty-cash-api `xero_settings.PETTYCASH_SLOTS`), so a company that finished matching had Publish
+  refused ("Xero settings incomplete"). Finish's answer (and Try again's) carries
+  `pettycash_contacts_missing` (`matching.pettycash_contacts_missing`): the keys `cash_sale`,
+  `director`, `discrepancy` still empty in `entity_pettycash_settings` - no `cash_sale` when the
+  company banks every sale (`uses_sales_cash = false`), `[]` without a settings row. minty-web then asks
+  whether to open Petty Cash Settings. Finish writes nothing for them.
 - **The sync never deletes what is used or Minty-made** (also 2026-11-11): `sync.apply_accounts`
   archives a used (or Minty-made) account Xero dropped and leaves rows with no Xero id alone;
   `_mirror_bills` keeps bill codes with no Xero id; the connect's contact clean-up and

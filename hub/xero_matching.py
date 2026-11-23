@@ -55,7 +55,8 @@ def _finish_suppliers(request: HttpRequest, user, entity_id) -> HttpResponse:
         matching.complete(entity_id)
         start_background_sync(entity_id, access_token, org, "Xero matching")
     entity = Entity.objects.get(id=entity_id)
-    return respond(request, {**matching.read(entity), "connected": not failed, "failed_contacts": failed})
+    return respond(request, {**matching.read(entity), "connected": not failed, "failed_contacts": failed,
+                             "pettycash_contacts_missing": matching.pettycash_contacts_missing(entity_id)})
 
 
 def company_xero_matching(request: HttpRequest) -> HttpResponse:
@@ -113,7 +114,8 @@ def company_xero_matching_finish(request: HttpRequest) -> HttpResponse:
         # A change of the matches is about the accounts (Phase 3): its suppliers are left as they are,
         # and the company stays connected - nothing is created in Xero.
         entity = Entity.objects.get(id=entity_id)
-        return respond(request, {**matching.read(entity), "connected": True, "failed_contacts": []})
+        return respond(request, {**matching.read(entity), "connected": True, "failed_contacts": [],
+                                 "pettycash_contacts_missing": matching.pettycash_contacts_missing(entity_id)})
     try:
         return _finish_suppliers(request, user, entity_id)
     except matching.Refused as refusal:

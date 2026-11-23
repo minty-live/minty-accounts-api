@@ -400,6 +400,40 @@ def _copy_in(guid, org=ORG):
     return XeroAccount.objects.get(xero_guid=guid, xero_org_id=org)
 
 
+def test_finish_names_the_petty_cash_contacts_still_to_choose(minty, xero):
+    """Production, 2026-11-23: a Minty company's daily closing had no contacts (Minty's rules need
+    none); Finish moves it to Xero's, which need three, and Publish then refused. Finish says which."""
+    _match_everything_used(minty)
+    body = call("post", BASE + "/finish", minty["admin"], minty["entity"].id).json()
+    assert body["connected"] is True
+    assert body["pettycash_contacts_missing"] == ["cash_sale", "director", "discrepancy"]
+
+
+def test_finish_leaves_out_the_cash_sale_contact_when_every_sale_is_banked(minty, xero):
+    Entity.objects.filter(id=minty["entity"].id).update(uses_sales_cash=False)
+    _match_everything_used(minty)
+    body = call("post", BASE + "/finish", minty["admin"], minty["entity"].id).json()
+    assert body["pettycash_contacts_missing"] == ["director", "discrepancy"]
+
+
+def test_finish_names_no_contact_once_all_three_are_chosen(minty, xero):
+    entity = minty["entity"]
+    person = XeroContactSync.objects.create(entity_id=entity.id, name="Ada Director", source="user")
+    customer = XeroContactSync.objects.create(entity_id=entity.id, name="Walk-in Customer", source="user")
+    EntityPettycashSettings.objects.filter(entity_id=entity.id).update(
+        cash_sale_contact_id=customer.id, director_contact_id=person.id, discrepancy_contact_id=person.id)
+    _match_everything_used(minty)
+    body = call("post", BASE + "/finish", minty["admin"], entity.id).json()
+    assert body["pettycash_contacts_missing"] == []
+
+
+def test_finish_names_no_contact_for_a_company_without_daily_closing_set(minty, xero):
+    EntityPettycashSettings.objects.filter(entity_id=minty["entity"].id).delete()
+    _match_everything_used(minty)
+    body = call("post", BASE + "/finish", minty["admin"], minty["entity"].id).json()
+    assert body["pettycash_contacts_missing"] == []
+
+
 @pytest.fixture
 def connected(minty, xero):
     """Phase 2 done: matched, connected, publishing from an earlier day."""
