@@ -259,12 +259,10 @@ def _repoint_replaced_settings(entity_id, snapshot: dict) -> None:
 
 
 def _code(account: dict) -> str | None:
-    """Xero's code as Minty reads it (the schema's ``account_code_from_xero``): none for an empty one,
-    or for a bank account whose "code" is its name."""
+    """Xero's code as Minty reads it (the schema's ``account_code_from_xero``, minty-db v0.17): none
+    for an empty one, or for one longer than 10 - an account's name in the code field, of any type."""
     code = str(account.get("Code") or "").strip()
-    if not code or (str(account.get("Type") or "").strip().upper() == "BANK" and len(code) > 10):
-        return None
-    return code[:10]
+    return code if 0 < len(code) <= 10 else None
 
 
 def _copy_accounts(entity_id, snapshot: dict, org) -> None:

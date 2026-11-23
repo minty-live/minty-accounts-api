@@ -281,6 +281,23 @@ def test_each_account_gets_its_xero_copy_and_is_linked_to_it(company, xero):
     assert rows["a-bank"].xero_account_link_id == copies["a-bank"].id
 
 
+def test_a_code_longer_than_ten_is_no_code_for_any_account_type(company, xero):
+    """18 Nov 2026: a Xero organisation's CURRENT accounts carried their names as codes ("Amount due
+    from LEE Min Ho"); account_info.code holds 10, so the row was refused and the connect failed.
+    minty-db v0.17 reads any code over 10 as no code; the copy reads it the same way, and xero_code
+    keeps Xero's value (what publishing sends)."""
+    long = "Amount due from LEE Min Ho"
+    xero.accounts = [acct("a-due", long, long, "CURRENT", Class="ASSET"), acct("a-ten", "ABCDEFGHIJ", "Ten")]
+
+    result = _run(company)
+
+    assert result["accounts"]["added"] == 2
+    rows, copies = _accounts(company), _copies(company)
+    assert (rows["a-due"].code, rows["a-due"].xero_code) == (None, long)
+    assert copies["a-due"].code is None, "a name in the code field is not a code, whatever the type"
+    assert (rows["a-ten"].code, copies["a-ten"].code) == ("ABCDEFGHIJ", "ABCDEFGHIJ")
+
+
 def test_a_recode_follows_and_an_account_xero_dropped_is_marked_deleted_in_the_copy(company, xero):
     xero.accounts = [acct("a-1", "429", "General"), acct("a-2", "430", "Travel")]
     _run(company)

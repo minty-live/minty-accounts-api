@@ -146,7 +146,9 @@ is removed: absence from Xero's answer is ambiguous. A failed page discards the 
 `docs/modernisation/xero_optional_database.md`):
 - Every account and contact Xero sent is upserted into `xero_account` / `xero_contact`, keyed by
   company, organisation and Xero id, with Xero's values verbatim. The code is read as the schema's
-  `account_code_from_xero` reads it: none for a bank account whose code field holds its name.
+  `account_code_from_xero` reads it: none for a code longer than 10 characters, of any account type -
+  the account's name in the code field (minty-db v0.17, 2026-11-23; before, bank accounts only, and a
+  CURRENT account named in its code made the connect fail). `xero_code` keeps Xero's full value.
 - The Minty row with that Xero id is linked to its copy (`xero_account_link_id` /
   `xero_contact_link_id`).
 - An account copy Xero no longer sends is marked `DELETED`, never removed: a link or a published
