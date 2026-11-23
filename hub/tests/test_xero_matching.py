@@ -120,7 +120,9 @@ def minty(shop, xero):
                                          account_type="EXPENSE", xero_account_id="", is_active=True)
     entity.refresh_from_db()
     matching.begin(entity.id, "tok", ORG)
-    Entity.objects.filter(id=entity.id).update(xero_org_id=ORG, xero_tenant_name="Olive Ltd", status="disconnected")
+    # as the connect records it (hub/xero_oauth._record): the organisation and the person connecting
+    Entity.objects.filter(id=entity.id).update(xero_org_id=ORG, xero_tenant_name="Olive Ltd", status="disconnected",
+                                               connected_by_user_id=shop["admin"].id)
     entity.refresh_from_db()
     return {"entity": entity, "admin": shop["admin"], "cashier": shop["cashier"], **rows}
 
@@ -291,6 +293,39 @@ def test_the_integration_page_says_matching_is_pending(minty):
     page = call("get", "/api/me/company/integration", minty["admin"], minty["entity"].id).json()
     assert page["setup_mode"] == "minty" and page["own_accounts"] == 9
     assert page["matching"] == {"accounts": True, "contacts": False, "reason": "first"}
+
+
+def test_opening_the_page_reads_xero_again_at_most_every_two_minutes(minty, xero):
+    """Production, 2026-11-23: banks made in Xero after the connect never reached the page - Continue
+    matching only showed the copy. Opening the page now refreshes with ``throttle`` (Settings' 2-minute
+    rule, C2); the Refresh button always reads."""
+    entity, admin = minty["entity"], minty["admin"]
+    xero.accounts.append({"AccountID": "x-bank2", "Code": "1012", "Name": "Bank 2", "Type": "BANK",
+                          "Status": "ACTIVE"})
+
+    def bank2(body):
+        return [o for o in body["options"] if o["name"] == "Bank 2"]
+
+    resp = call("post", BASE + "/refresh", admin, entity.id, {"throttle": True})
+    assert resp.status_code == 200, resp.content
+    assert bank2(resp.json()) == [], "the copy was read moments ago (the connect): Xero isn't asked again"
+
+    XeroAccount.objects.filter(entity_id=entity.id).update(synced_at=datetime.now(ZoneInfo("UTC")) - sync.SETTINGS_READ_EVERY)
+    body = call("post", BASE + "/refresh", admin, entity.id, {"throttle": True}).json()
+    assert [o["kind"] for o in bank2(body)] == ["bank"]
+
+    xero.accounts.append({"AccountID": "x-bank3", "Code": "1013", "Name": "Bank 3", "Type": "BANK",
+                          "Status": "ACTIVE"})
+    body = call("post", BASE + "/refresh", admin, entity.id).json()
+    assert "Bank 3" in [o["name"] for o in body["options"]], "the button reads Xero whenever it is pressed"
+
+
+def test_the_page_says_whether_this_person_may_refresh(minty):
+    entity = minty["entity"]
+    assert call("get", BASE, minty["admin"], entity.id).json()["can_edit"] is True
+    viewer = call("get", BASE, minty["cashier"], entity.id)
+    assert viewer.status_code == 200 and viewer.json()["can_edit"] is False
+    assert call("post", BASE + "/refresh", minty["cashier"], entity.id, {"throttle": True}).status_code == 403
 
 
 def test_petty_cash_and_the_bank_cant_become_one_xero_account(minty):
@@ -580,6 +615,25 @@ def test_disconnecting_during_the_first_matching_goes_back_to_minty_on_its_own(m
     assert not AccountMatchDraft.objects.filter(entity_id=entity.id).exists()
     page = call("get", "/api/me/company/integration", admin, entity.id).json()
     assert page["matching"] == {"accounts": False, "contacts": False, "reason": None}
+
+
+def test_a_disconnected_company_with_a_minty_only_supplier_is_not_matching(connected):
+    """Production, 2026-11-23: a connected company disconnected and its Integration card still said
+    "Matching isn't finished". A supplier added in Minty stays out of Xero until a publish (C1), so
+    the contacts step must only count while someone's Xero connection is in place - a Disconnect,
+    which keeps the organisation, ends it."""
+    entity, admin = connected["entity"], connected["admin"]
+    XeroContactSync.objects.create(entity_id=entity.id, name="Star Ferry Logistics", source="user")
+    page = call("get", "/api/me/company/integration", admin, entity.id).json()
+    assert page["matching"] == {"accounts": False, "contacts": False, "reason": None}, "connected: nothing pending"
+
+    resp = call("post", "/api/me/company/xero/disconnect", admin, entity.id)
+    assert resp.status_code == 200, resp.content
+    entity.refresh_from_db()
+    assert (str(entity.xero_org_id), entity.status, entity.setup_mode) == (ORG, "disconnected", "xero")
+    page = call("get", "/api/me/company/integration", admin, entity.id).json()
+    assert page["matching"] == {"accounts": False, "contacts": False, "reason": None}
+    assert call("post", BASE + "/contacts", admin, entity.id).status_code == 409
 
 
 def test_disconnecting_while_changing_the_matches_keeps_the_organisation(connected):

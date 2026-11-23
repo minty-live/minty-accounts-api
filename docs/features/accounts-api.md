@@ -442,7 +442,7 @@ pointing at nothing.
   pick, a suggestion - a bank by its number, else the same type with a similar name - a same-code
   other-type conflict, whether a record uses it), `PATCH` `{account_id, xero_account_id | null}` (one pick;
   saved at once; a bank only to a bank, else the same class; daily closing's petty cash and bank never
-  one Xero account - refused here and at Finish, `matching.SAME_BANK`), `POST .../refresh` (Xero's accounts again),
+  one Xero account - refused here and at Finish, `matching.SAME_BANK`), `POST .../refresh` (Xero's accounts again; `{"throttle": true}`, the page opening, skips Xero when the chart was read under `SETTINGS_READ_EVERY`; the GET adds `can_edit`),
   `POST .../finish`, `POST .../contacts`.
 - **Used** (`xero/services/usage.py`, owner 2026-11-11, extending the doc's Q8): an expense line, a bill
   line (by id, or by code on an older line), any daily-closing account, or an account combined into it.
@@ -557,4 +557,7 @@ The doc "Minty Xero Sync & Report Decisions" (claude.ai artifact HV37p5LpnzconZB
 (`account_match_draft`). A company that never finished its FIRST matching (`setup_mode` still `minty`)
 was never connected, so its organisation goes too: it keeps its books in Minty, as before it signed in
 to Xero. A connected company (changing its matches, or a new organisation or accounts) keeps its
-organisation, as every disconnect does. Tests: `hub/tests/test_xero_matching.py`.
+organisation, as every disconnect does. The suppliers step (`matching.contacts_pending`: accounts
+matched, a supplier not in Xero, not `connected`) counts only while `connected_by_user_id` is set - a
+Disconnect clears it, so a disconnected company with Minty-only suppliers (C1) reads disconnected, not
+"Matching isn't finished" (production, 2026-11-23). Tests: `hub/tests/test_xero_matching.py`.

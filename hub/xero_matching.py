@@ -5,11 +5,12 @@ Each is the hub's door plus ``?entity=`` and a permission, as the Integration ta
 (``hub/company.py`` ``_open``): reading needs ``XERO_SETTINGS_VIEW``, everything else
 ``XERO_SETTINGS_UPDATE``. Refusals are ``{"error": <sentence>}`` with the service's status.
 
-- ``GET  /api/me/company/xero/matching``: the page.
+- ``GET  /api/me/company/xero/matching``: the page, plus ``can_edit`` (``XERO_SETTINGS_UPDATE``).
 - ``PATCH /api/me/company/xero/matching`` ``{account_id, xero_account_id | null}``: one pick (saved at
   once, so the page can be finished later). PATCH, not PUT: the hub's CORS answer
   (``hub/transport.py`` ``METHODS``) allows no PUT, so a browser never sent one.
-- ``POST /api/me/company/xero/matching/refresh``: Xero's accounts read again.
+- ``POST /api/me/company/xero/matching/refresh``: Xero's accounts read again; ``{"throttle": true}``
+  (the page opening) skips Xero when they were read under 2 minutes ago.
 - ``POST /api/me/company/xero/matching/finish``: the replace, then the suppliers; answers
   ``{connected, failed_contacts}`` with the page.
 - ``POST /api/me/company/xero/matching/contacts``: the suppliers Xero refused, sent again.
@@ -25,7 +26,7 @@ from django.http import HttpRequest, HttpResponse
 from minty_db.models import Entity
 
 from hub.company import _body, _open, _uuid
-from hub.policy import Permission
+from hub.policy import Permission, has_permission
 from hub.transport import refuse, respond
 from xero.services import matching
 from xero.services.connect import MirrorFailed
@@ -77,7 +78,9 @@ def company_xero_matching(request: HttpRequest) -> HttpResponse:
     early, user, entity_id = _open(request, Permission.XERO_SETTINGS_VIEW, NO_VIEW)
     if early is not None:
         return early
-    return respond(request, matching.read(Entity.objects.get(id=entity_id)))
+    # can_edit: whether the page may refresh from Xero on opening (XERO_SETTINGS_UPDATE)
+    return respond(request, {**matching.read(Entity.objects.get(id=entity_id)),
+                             "can_edit": has_permission(user, Permission.XERO_SETTINGS_UPDATE, entity_id)})
 
 
 def company_xero_matching_refresh(request: HttpRequest) -> HttpResponse:
@@ -88,7 +91,7 @@ def company_xero_matching_refresh(request: HttpRequest) -> HttpResponse:
         return early
     try:
         access_token, _org = _token(entity_id)
-        return respond(request, matching.refresh(entity_id, access_token))
+        return respond(request, matching.refresh(entity_id, access_token, throttle=_body(request).get("throttle") is True))
     except matching.Refused as refusal:
         return refuse(request, refusal.message, refusal.status)
     except MirrorFailed:

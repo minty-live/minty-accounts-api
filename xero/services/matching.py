@@ -48,7 +48,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from django.db import connection, transaction
-from django.db.models import Q
+from django.db.models import Max, Q
 from django.utils import timezone
 from minty_db.models import (
     AccountChangeLog,
@@ -207,8 +207,11 @@ def accounts_pending(entity: Entity) -> bool:
 
 def contacts_pending(entity: Entity) -> bool:
     """The accounts are matched (Finish ran: ``xero_publish_from`` set, no matching open) and some
-    suppliers aren't in this organisation yet, so the company is still disconnected."""
+    suppliers aren't in this organisation yet, so the company is still disconnected - while someone's
+    Xero connection is in place (``connected_by_user_id``, set by the connect). A Disconnect clears it
+    and keeps the organisation: that company is disconnected, not matching (production, 2026-11-23)."""
     return (entity.setup_mode == "xero" and bool(entity.xero_org_id) and entity.status != "connected"
+            and entity.connected_by_user_id is not None
             and not entity.xero_matching and entity.xero_publish_from is not None
             and own_suppliers(entity.id, entity.xero_org_id).exists())
 
@@ -469,10 +472,22 @@ def pick(entity_id, account_id, xero_account_id, user_id) -> dict:
     return read(entity)
 
 
-def refresh(entity_id, access_token) -> dict:
+def read_recently(entity_id, org) -> bool:
+    """The organisation's chart was copied under ``sync.SETTINGS_READ_EVERY`` ago (every fill stamps
+    each copy's ``synced_at``)."""
+    newest = XeroAccount.objects.filter(entity_id=entity_id, xero_org_id=str(org)).aggregate(
+        newest=Max("synced_at"))["newest"]
+    return newest is not None and timezone.now() - newest < sync.SETTINGS_READ_EVERY
+
+
+def refresh(entity_id, access_token, *, throttle=False) -> dict:
     """Refresh from Xero: the copies again (an account created in Xero meanwhile appears) and any new
-    automatic picks."""
+    automatic picks. ``throttle`` - opening the page (production, 2026-11-23: banks made in Xero after
+    the connect never showed) - skips Xero when the chart was read under 2 minutes ago (C2)."""
     entity = _pending_entity(entity_id)
+    if throttle and read_recently(entity_id, entity.xero_org_id):
+        logger.info("xero matching: company %s's chart read under 2 minutes ago; not read again", entity_id)
+        return read(entity)
     with transaction.atomic():
         _fill_copies(entity_id, access_token, entity.xero_org_id)
         auto_pick(entity_id, entity.xero_org_id, entity.xero_matching)
