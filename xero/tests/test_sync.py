@@ -480,6 +480,21 @@ def test_a_xero_contact_of_a_minty_contacts_name_links_to_it_never_a_second_row(
     assert xero.made == []
 
 
+def test_a_xero_contact_of_a_minty_contacts_name_typed_another_way_links_to_it(company, xero):
+    """The user, 2026-11-23: punctuation doesn't count either ("7 Eleven" is "7-Eleven"); a name with
+    no letters or digits matches nothing."""
+    own = XeroContactSync.objects.create(entity_id=company.id, name="7 Eleven", source="user")
+    dash = XeroContactSync.objects.create(entity_id=company.id, name="-", source="user")
+    xero.contact_pages = [[{"ContactID": "c-7", "Name": "7-ELEVEN"}, {"ContactID": "c-dot", "Name": "."}]]
+
+    _run(company)
+
+    own.refresh_from_db()
+    dash.refresh_from_db()
+    assert (own.xero_contact_id, dash.xero_contact_id) == ("c-7", None)
+    assert XeroContactSync.objects.filter(entity_id=company.id).count() == 3
+
+
 def test_a_xero_account_of_a_minty_accounts_code_and_type_links_to_it(company, xero):
     own = AccountInfo.objects.create(entity_id=company.id, name="Rent", code="469", xero_code="469",
                                      account_type="expense", type="EXPENSE", status="ACTIVE", source="user")

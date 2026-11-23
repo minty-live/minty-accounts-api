@@ -66,6 +66,7 @@ from minty_db.models import (
     XeroContact,
     XeroContactSync,
 )
+from minty_shared import names
 
 from xero.services import sync, usage
 from xero.services.connect import MirrorFailed
@@ -697,8 +698,8 @@ def _link_supplier(entity_id, supplier, guid, name, org, batch, user_id, kind) -
 
 
 def link_suppliers(entity_id, access_token, org, user_id) -> list[str]:
-    """Every own supplier linked to the Xero contact of its name (case and extra spaces ignored,
-    ``sync._name_key``); one with no such contact stays in Minty and goes to Xero at its first
+    """Every own supplier linked to the Xero contact of its name (case, spaces and punctuation
+    ignored - ``minty_shared.names``, the user 2026-11-23); one with no such contact stays in Minty and goes to Xero at its first
     publish - connecting creates nothing in Xero (owner's decisions doc C2, 2026-11-19). Each in its
     own transaction. Returns no names: nothing can be refused (the list stays for the routes' answer)."""
     contacts = sync.fetch_contacts(access_token, org)
@@ -710,13 +711,13 @@ def link_suppliers(entity_id, access_token, org, user_id) -> list[str]:
     by_name: dict = {}
     for contact in sorted(contacts, key=lambda c: (str(c.get("ContactStatus") or "ACTIVE").upper() != "ACTIVE",
                                                    str(c.get("ContactID") or ""))):
-        key = sync._name_key(contact.get("Name"))
+        key = names.name_key(contact.get("Name"))
         if key and contact.get("ContactID"):
             by_name.setdefault(key, contact)
     batch = uuid.uuid4()
     left = 0
     for supplier in list(own_suppliers(entity_id, org).order_by("name")):
-        match = by_name.get(sync._name_key(supplier.name))
+        match = by_name.get(names.name_key(supplier.name))
         if match is None:
             left += 1  # not in Xero: it goes there at its first publish
             continue

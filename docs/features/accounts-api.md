@@ -461,7 +461,7 @@ pointing at nothing.
   logged in `account_change_log` (one batch); drafts deleted; `setup_mode = 'xero'` and
   `xero_publish_from` = today (Hong Kong; the day Finish ran, no longer a publish cut-off: owner 2026-11-18, any record publishes once Xero is connected).
 - **Suppliers** (after the replace commits): each own supplier linked to the Xero contact of its name
-  (case and extra spaces ignored, `sync._name_key`; the active one first, else the first by Xero id -
+  (case, spaces and punctuation ignored - `minty_shared.names`, the user 2026-11-23: "7 Eleven" is "7-Eleven"; the active one first, else the first by Xero id -
   the doc's Q9 default); one already stored here is merged into it. Logged in `contact_change_log`.
   **Connecting creates nothing in Xero** (owner's decisions doc C2, 2026-11-19): a supplier with no
   Xero contact of its name stays in Minty and goes to Xero at its first publish (C1), so Finish
@@ -518,7 +518,7 @@ Tests: `hub/tests/test_company_chart.py`.
 **No duplicates from the sync (owner, 2026-11-12; `xero/services/sync.py`).** A Xero account Minty
 doesn't hold yet takes the place of the company's own unlinked account of the same code and type
 (`linked` in the counts); a Xero contact, of the company's own unlinked contact of the same name
-(case and inner spaces ignored) - never a second row beside it. **The sync only reads** (owner's
+(case, spaces and punctuation ignored - `minty_shared.names`, 2026-11-23; a name with no letters or digits matches nothing) - never a second row beside it. **The sync only reads** (owner's
 decisions doc C2, 2026-11-19): nothing goes to Xero from any sync, the connect's included - a contact
 made in Minty reaches Xero when it is added while connected (C5) or at its first publish (C1).
 Tests: `xero/tests/test_sync.py`.

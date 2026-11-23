@@ -52,6 +52,7 @@ from minty_db.models import (
     XeroContact,
     XeroContactSync,
 )
+from minty_shared import names
 
 from xero.services import usage
 
@@ -341,17 +342,19 @@ def apply_contacts(entity_id, contacts: list[dict], org) -> dict:
         lock(entity_id)
         stored = {c.xero_contact_id: c for c in XeroContactSync.objects.filter(entity_id=entity_id)}
         # No duplicates (owner, 2026-11-12): a new Xero contact is the company's own unlinked one of
-        # the same name (case and inner spaces ignored), rather than a second row beside it.
-        own = {_name_key(c.name): c for c in XeroContactSync.objects.filter(
+        # the same name (case, spaces and punctuation ignored - ``minty_shared.names``, the user
+        # 2026-11-23: "7 Eleven" is "7-Eleven"), rather than a second row beside it.
+        own = {names.name_key(c.name): c for c in XeroContactSync.objects.filter(
             entity_id=entity_id, source__in=MINTY_MADE, merged_into__isnull=True, record_status="active")
             .filter(models.Q(xero_contact_id__isnull=True) | models.Q(xero_contact_id=""))}
+        own.pop("", None)  # a name with no letters or digits matches nothing
         for contact in contacts:
             contact_id = contact.get("ContactID")
             if not contact_id:
                 continue
             name = _trunc(contact.get("Name", ""), 150) or ""
             row = stored.get(contact_id)
-            if row is None and (mine := own.pop(_name_key(name), None)) is not None:
+            if row is None and (mine := own.pop(names.name_key(name) or None, None)) is not None:
                 XeroContactSync.objects.filter(id=mine.id).update(xero_contact_id=contact_id, xero_org_id=str(org))
                 stored[contact_id] = True
                 counts["linked"] += 1
@@ -369,10 +372,6 @@ def apply_contacts(entity_id, contacts: list[dict], org) -> dict:
             _copy_contacts(entity_id, contacts, org)
     logger.info("xero sync: contacts for company %s: %s", entity_id, counts)
     return counts
-
-
-def _name_key(name) -> str:
-    return " ".join(str(name or "").split()).lower()
 
 
 def _copy_contacts(entity_id, contacts: list[dict], org) -> None:

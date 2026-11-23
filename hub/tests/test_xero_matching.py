@@ -274,6 +274,17 @@ def test_suppliers_are_linked_by_name_and_the_rest_stay_in_minty_and_it_connects
     assert Entity.objects.get(id=entity.id).status == "connected"
 
 
+def test_a_supplier_typed_another_way_is_linked_to_xeros_contact_of_its_name(minty, xero):
+    """The user, 2026-11-23: case, spaces and punctuation don't count ("abc-supplies")."""
+    entity = minty["entity"]
+    abc = XeroContactSync.objects.create(entity_id=entity.id, name="abc-supplies", source="user")
+    _match_everything_used(minty)
+
+    body = call("post", BASE + "/finish", minty["admin"], entity.id).json()
+    assert (body["connected"], body["failed_contacts"]) == (True, [])
+    assert XeroContactSync.objects.get(id=abc.id).xero_contact_id == "c-abc"
+
+
 def test_a_company_the_old_rule_left_disconnected_is_connected_by_try_again(minty, xero):
     """Before 2026-11-19 Finish kept a company disconnected until every supplier was in Xero. Try
     again (the contacts route) now links by name and connects it, creating nothing."""
