@@ -79,6 +79,17 @@ def sign_in_ended(request: HttpRequest) -> bool:
 
 
 def sign_in(request: HttpRequest, user: User) -> None:
+    sid = request.session.get(LOGIN_SID_KEY)
+    if (request.session.get(USER_KEY) == str(user.id) and sid
+            and request.session.session_key == session_key_for(sid)):
+        # The same person, still signed in (a Xero connect's callback, a second sign-in tab): the
+        # sign-in is kept, so the tokens other tabs and apps hold stay good (2026-11-24: a new one
+        # ended them all, and each showed "Your session has expired"). The key already came from
+        # a sign-in, so keeping it fixes nothing on anyone. The Terms are still checked afresh.
+        request.session.pop("terms_ok", None)
+        request.session["last_activity"] = time.time()
+        logger.info("session: already signed in user=%s; sign-in kept", user.id)
+        return
     sid = uuid.uuid4().hex
     request.session.bind(sid)  # a new key, derived from the sid (hub/session_store.py)
     request.session.pop("terms_ok", None)  # a new sign-in is checked against the Terms afresh
