@@ -160,8 +160,9 @@ def _log(entity_id, row: AccountInfo, kind: str, before: tuple, batch, org) -> N
     )
 
 
-def apply_accounts(entity_id, accounts: list[dict], org) -> dict:
-    """Make the company's account tables match Xero's ACTIVE ``accounts`` (non-empty)."""
+def apply_accounts(entity_id, accounts: list[dict], org, skip: frozenset = frozenset()) -> dict:
+    """Make the company's account tables match Xero's ACTIVE ``accounts`` (non-empty). ``skip``: Xero
+    ids not to add as accounts of their own (an open change already gives each to an account)."""
     counts = {"added": 0, "linked": 0, "activated": 0, "refreshed": 0, "archived": 0, "deleted": 0}
     batch = uuid.uuid4()
     with transaction.atomic():
@@ -194,6 +195,8 @@ def apply_accounts(entity_id, accounts: list[dict], org) -> dict:
             kept[row.xero_account_id] = row
         for account_id, account in snapshot.items():
             row = kept.get(account_id)
+            if row is None and account_id in skip:
+                continue
             if row is None:
                 mine = own.pop((str(account.get("Code") or "").strip(), account.get("Type")), None)
                 if mine is not None:
@@ -452,12 +455,23 @@ def sync_company(entity_id, access_token: str, org) -> dict:
     contacts = fetch_contacts(access_token, org)
     from minty_db.models import Entity
 
+    if Entity.objects.filter(id=entity_id, setup_mode="xero", xero_matching="change").exists():
+        # A change of matches (the user, 2026-11-24): the company stays connected to the same
+        # organisation, so Xero's new accounts come in as on any sync - an open change held them back
+        # for days in production - each matched to itself on the page (``matching.sync_during_change``).
+        from xero.services import matching
+
+        return {
+            "accounts": matching.sync_during_change(entity_id, accounts, org) if accounts else None,
+            "contacts": apply_contacts(entity_id, contacts, org) if contacts is not None else None,
+        }
     if Entity.objects.filter(id=entity_id).filter(
             models.Q(setup_mode="minty") | models.Q(xero_matching__isnull=False)).exists():
-        # Still Minty's books, or any matching open (Phase 3, 2026-11-12: a new organisation, new
-        # accounts, a change) - its accounts are being matched (Settings Phase 2, 2026-11-11): only the
-        # Xero copies are refreshed. A new organisation's chart would otherwise archive the old one's. Importing Xero's chart as accounts would put rows beside the
-        # company's own holding the very Xero ids matching's Finish links.
+        # Still Minty's books, or a first or new-organisation matching open (Phase 3, 2026-11-12) -
+        # its accounts are being matched (Settings Phase 2, 2026-11-11): only the Xero copies are
+        # refreshed. A new organisation's chart would otherwise archive the old one's. Importing Xero's
+        # chart as accounts would put rows beside the company's own holding the very Xero ids
+        # matching's Finish links.
         with transaction.atomic():
             lock(entity_id)
             if accounts:

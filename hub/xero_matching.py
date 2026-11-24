@@ -115,18 +115,20 @@ def company_xero_matching_finish(request: HttpRequest) -> HttpResponse:
         matching.finish(entity_id, user.id)
     except matching.Refused as refusal:
         return refuse(request, refusal.message, refusal.status)
+    from hub.xero_oauth import start_background_sync
+
     if not changing:
         # The contacts step's answers went in with the accounts (the user, 2026-11-24): connected now.
         # A change of the matches is about the accounts, and the company stayed connected.
-        from hub.xero_oauth import start_background_sync
-
         matching.complete(entity_id)
-        try:
-            access_token, org = _token(entity_id)
-        except matching.Refused:
-            logger.warning("xero matching: company %s finished with no Xero token; the first sync waits", entity_id)
-        else:
-            start_background_sync(entity_id, access_token, org, "Xero matching")
+    # Either way Xero is read at once (the user, 2026-11-24: after a change too, so Xero's accounts
+    # don't wait for the next Settings visit).
+    try:
+        access_token, org = _token(entity_id)
+    except matching.Refused:
+        logger.warning("xero matching: company %s finished with no Xero token; the sync waits", entity_id)
+    else:
+        start_background_sync(entity_id, access_token, org, "Xero matching")
     entity = Entity.objects.get(id=entity_id)
     return respond(request, {**matching.read(entity), "connected": True, "failed_contacts": [],
                              "pettycash_contacts_missing": matching.pettycash_contacts_missing(entity_id)})

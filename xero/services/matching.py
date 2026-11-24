@@ -536,6 +536,27 @@ def cancel_change(entity_id) -> dict:
     return read(entity)
 
 
+def sync_during_change(entity_id, accounts: list[dict], org) -> dict:
+    """A sync while the matches are being changed (the user, 2026-11-24): Xero's accounts come in as
+    on any sync, except one the change already gives to an account (Finish links it there), and each
+    new one starts matched to itself, so it never blocks Finish. Holds the company row, as Finish
+    does, so the two never interleave; a change Finish or Cancel closed meanwhile is an ordinary sync."""
+    with transaction.atomic():
+        entity = Entity.objects.select_for_update().get(id=entity_id)
+        if entity.xero_matching != "change":
+            if entity.xero_matching is None and entity.setup_mode == "xero":
+                return sync.apply_accounts(entity_id, accounts, org)
+            sync.lock(entity_id)
+            sync._copy_accounts(entity_id, {a["AccountID"]: a for a in accounts if a.get("AccountID")}, org)
+            return {"copied": len(accounts)}
+        picked = AccountMatchDraft.objects.filter(entity_id=entity_id).values_list("xero_account_id", flat=True)
+        held = frozenset(XeroAccount.objects.filter(id__in=list(picked)).values_list("xero_guid", flat=True))
+        counts = sync.apply_accounts(entity_id, accounts, org, skip=held)
+        counts["prefilled"] = _prefill_links(entity_id, org, _active_accounts(entity_id))
+    logger.info("xero sync: company %s is changing its matches; accounts %s", entity_id, counts)
+    return counts
+
+
 def _pending_entity(entity_id) -> Entity:
     entity = Entity.objects.get(id=entity_id)
     if not accounts_pending(entity):

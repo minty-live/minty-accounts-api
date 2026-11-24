@@ -541,11 +541,17 @@ pointing at nothing.
   the marker, resets `xero_publish_from` to today for `first`/`new_org` and keeps it for
   `new_accounts`/`change` (a record of when Finish ran, no longer a publish cut-off);
   a change asks no contacts (nothing created in Xero). Suppliers of another organisation are the
-  contacts step's after a new organisation's connect. While any matching is
-  open the sync refreshes only the copies. Tests: `hub/tests/test_xero_matching.py`,
+  contacts step's after a new organisation's connect. While a `first`, `new_accounts` or `new_org`
+  matching is open the sync refreshes only the copies. **While the matches are being changed** (the
+  user, 2026-11-24; production: a change left open from 19 Nov kept 58 Xero accounts out of a company
+  for days) the sync takes Xero's new accounts in as on any sync (`matching.sync_during_change`, under
+  the company row's lock like Finish): one the change already gives to an account is not added beside
+  it (`apply_accounts(skip=...)`; Finish links it), and each new one starts matched to itself
+  (`_prefill_links`), so it never blocks Finish. **Every Finish starts the background sync**, a
+  change's too, so Xero's accounts arrive at once. Tests: `hub/tests/test_xero_matching.py`,
   `test_xero_oauth.py` (`test_a_minty_companys_connect_keeps_every_account_and_goes_to_matching`),
   `xero/tests/test_sync.py` (the archive-not-delete cases); Postgres only.
-- **While matching** (`setup_mode` still `minty`), `sync.sync_company` - the sync every app asks for -
+- **While matching** (`setup_mode` still `minty`, or a `new_accounts`/`new_org` matching), `sync.sync_company` - the sync every app asks for -
   refreshes only the Xero copies: importing Xero's chart as accounts put rows beside the company's own
   holding the Xero ids Finish links. Finish removes an unused Xero-made row that holds a picked Xero
   account (one a sync made before this) instead of refusing; a used one still refuses.

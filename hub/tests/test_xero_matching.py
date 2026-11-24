@@ -656,14 +656,80 @@ def test_a_new_organisation_is_matched_from_scratch_and_older_records_stay_behin
     assert AccountInfo.objects.get(id=connected["rent"].id).xero_account_id == "y-rent"
 
 
-def test_a_sync_while_any_matching_is_open_only_refreshes_the_copies(connected, xero):
-    entity = connected["entity"]
-    assert call("post", BASE + "/change", connected["admin"], entity.id).status_code == 200
+def test_a_sync_while_changing_adds_xeros_new_accounts_matched_to_themselves(connected, xero):
+    """The user, 2026-11-24 (production: a change left open from 19 Nov kept 58 Xero accounts out of
+    Minty for days): an open change no longer holds back Xero's new accounts. Each comes in as on any
+    sync, already matched to itself on the page, so it never blocks Finish."""
+    entity, admin = connected["entity"], connected["admin"]
+    assert call("post", BASE + "/change", admin, entity.id).status_code == 200
     xero.accounts = [*xero.accounts, {"AccountID": "x-new", "Code": "499", "Name": "Sundries", "Type": "EXPENSE",
                                       "Status": "ACTIVE"}]
+
     sync.sync_company(entity.id, "tok", ORG)
-    assert not AccountInfo.objects.filter(entity_id=entity.id, xero_account_id="x-new").exists()
-    assert XeroAccount.objects.filter(entity_id=entity.id, xero_guid="x-new").exists()
+
+    new = AccountInfo.objects.get(entity_id=entity.id, xero_account_id="x-new")
+    assert (new.code, new.name, new.status) == ("499", "Sundries", "ACTIVE")
+    assert Entity.objects.get(id=entity.id).xero_matching == "change", "the change stays open"
+    body = call("get", BASE, admin, entity.id).json()
+    assert body["blocking"] == 0 and body["matched"] == body["total"]
+    assert _rows(body)["Sundries"]["pick"]["xero_account_id"] == str(_copy_in("x-new").id)
+    resp = call("post", BASE + "/finish", admin, entity.id)
+    assert resp.status_code == 200, resp.content
+    assert AccountInfo.objects.get(id=new.id).xero_account_id == "x-new"
+
+
+def test_a_xero_account_picked_while_changing_is_not_added_beside_its_pick(connected, xero):
+    """A Xero account the change already gives to one of the company's accounts stays that account's:
+    the sync doesn't add it as a second account, and Finish links it as picked."""
+    entity, admin = connected["entity"], connected["admin"]
+    assert call("post", BASE + "/change", admin, entity.id).status_code == 200
+    assert not AccountInfo.objects.filter(entity_id=entity.id, xero_account_id="x-print").exists()
+    assert _pick_in(connected, "unused", "x-print").status_code == 200
+    xero.accounts = [*xero.accounts, {"AccountID": "x-new", "Code": "499", "Name": "Sundries", "Type": "EXPENSE",
+                                      "Status": "ACTIVE"}]
+
+    sync.sync_company(entity.id, "tok", ORG)
+
+    assert not AccountInfo.objects.filter(entity_id=entity.id, xero_account_id="x-print").exists()
+    assert AccountInfo.objects.filter(entity_id=entity.id, xero_account_id="x-new").exists(), (
+        "the Xero accounts nobody picked come in")
+    body = call("get", BASE, admin, entity.id).json()
+    assert body["blocking"] == 0, body
+    resp = call("post", BASE + "/finish", admin, entity.id)
+    assert resp.status_code == 200, resp.content
+    assert AccountInfo.objects.get(id=connected["unused"].id).xero_account_id == "x-print"
+
+
+def test_a_sync_during_a_new_organisations_matching_still_only_refreshes_the_copies(connected, xero, monkeypatch):
+    """Only a change of matches takes Xero's new accounts in: a new organisation's chart is matched
+    from scratch, and importing it would put rows beside the company's own."""
+    entity = connected["entity"]
+    xero.accounts = [{**a, "AccountID": a["AccountID"].replace("x-", "y-")} for a in xero.accounts]
+    with transaction.atomic():
+        matching.begin(entity.id, "tok", ORG2, reason="new_org")
+        Entity.objects.filter(id=entity.id).update(xero_org_id=ORG2, status="disconnected")
+
+    sync.sync_company(entity.id, "tok", ORG2)
+
+    assert not AccountInfo.objects.filter(entity_id=entity.id, xero_account_id__startswith="y-").exists()
+    assert XeroAccount.objects.filter(entity_id=entity.id, xero_org_id=ORG2, xero_guid="y-rent").exists()
+
+
+def test_finishing_a_change_syncs_at_once(connected, monkeypatch):
+    """The user, 2026-11-24: Finish of a change reads Xero straight away, as a first Finish does, so
+    Xero's accounts don't wait for the next Settings visit."""
+    from hub import xero_oauth
+
+    started = []
+    monkeypatch.setattr(xero_oauth, "start_background_sync", lambda *a, **k: started.append(a))
+    entity, admin = connected["entity"], connected["admin"]
+    assert call("post", BASE + "/change", admin, entity.id).status_code == 200
+
+    resp = call("post", BASE + "/finish", admin, entity.id)
+
+    assert resp.status_code == 200, resp.content
+    assert [(str(a[0]), *a[1:3]) for a in started] == [(str(entity.id), "tok", ORG)]
+    assert Entity.objects.get(id=entity.id).status == "connected"
 
 
 
