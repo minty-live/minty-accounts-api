@@ -587,6 +587,48 @@ def test_a_currency_picked_by_hand_beats_the_countrys_own(shop, singapore):
     assert company_money(shop["entity"]) == ("SG", hkd, "$", {hkd}, 5)
 
 
+def live(entity, monkeypatch, status="connected"):
+    """The company holds a Xero organisation (no token: the page asks nothing of Xero)."""
+    Entity.objects.filter(id=entity.id).update(xero_org_id=uuid.uuid4(), status=status)
+    monkeypatch.setattr(company, "resolve_entity_access_token", lambda entity_id: None)
+
+
+@pytest.mark.parametrize("org, status, locked", [
+    (False, "disconnected", False),
+    (True, "connected", True),
+    (True, "onboarding", True),  # the wizard already linked Xero
+    (True, "disconnected", False),  # kept after a disconnect, or mid-matching
+])
+def test_the_tab_says_when_the_currency_follows_xero(shop, monkeypatch, org, status, locked):
+    if org:
+        live(shop["entity"], monkeypatch, status)
+    assert integration(shop["admin"], shop["entity"]).json()["currency_locked"] is locked
+
+
+def test_a_connected_company_keeps_its_currency(shop, singapore, monkeypatch):
+    """The user, 2026-11-24: the currency is locked while the company is connected to Xero."""
+    live(shop["entity"], monkeypatch)
+    hkd = str(shop["currency"].id)
+    before = company_money(shop["entity"])
+    resp = integration(shop["admin"], shop["entity"], {"currency_id": str(singapore.id)})
+    assert (resp.status_code, resp.json()) == (409, {"error": company.CURRENCY_LOCKED})
+    assert company.CURRENCY_LOCKED == ("This company is connected to Xero, so its currency stays the same as "
+                                       "Xero's. To change it, disconnect Xero first.")
+    assert company_money(shop["entity"]) == before
+    # a country alone no longer brings its own currency; the same currency sent back is no change
+    saved = integration(shop["admin"], shop["entity"], {"country_code": "SG", "currency_id": hkd, "name": "New"})
+    assert saved.status_code == 200, saved.json()
+    assert company_money(shop["entity"]) == ("SG", *before[1:])  # currency, format and notes untouched
+    saved = integration(shop["admin"], shop["entity"], {"country_code": "SG"})
+    assert saved.status_code == 200 and company_money(shop["entity"]) == ("SG", *before[1:])
+
+
+def test_a_disconnected_company_that_kept_its_organisation_may_change_currency(shop, singapore, monkeypatch):
+    live(shop["entity"], monkeypatch, "disconnected")
+    saved = integration(shop["admin"], shop["entity"], {"currency_id": str(singapore.id)})
+    assert saved.status_code == 200 and company_money(shop["entity"])[1] == str(singapore.id)
+
+
 def test_a_failed_save_is_a_500_and_changes_nothing(shop, singapore, monkeypatch):
     def broken(entity_id, currency_id):
         raise RuntimeError("boom")

@@ -459,7 +459,9 @@ token every Xero call for the company uses.
 - **Connecting** (`hub/xero_oauth.py`, `xero/services/connect.py`): the state carries the company,
   its name and who clicked, plus the nonce; the callback checks the Xero login belongs to that
   person, keeps one Xero organisation to one company, needs the organisation's financial year
-  end, mirrors its chart and contacts, and hands a refused grant back at Xero. A connect needs
+  end and base currency, refuses an organisation whose base currency isn't the company's (saying
+  what to change, 2026-11-24), mirrors its chart and contacts, and hands a refused grant back at
+  Xero. A connect needs
   `XERO_SETTINGS_UPDATE` on a named company; with no company named, nothing is connected.
   Detail: `accounts-api.md`, Xero OAuth.
 - **Only this service refreshes** (`xero/services/tokens.py`). Xero rotates the refresh token on

@@ -158,11 +158,13 @@ def _login(request: HttpRequest, user: User) -> None:
 def _onboarding_xero_return(request: HttpRequest, connected: bool, org_name: str = "", *, mismatch: bool = False,
                             expected: str = "", conflict: bool = False, conflict_entity: str = "",
                             conflict_entity_id: str = "", conflict_can_move: bool = False,
-                            choose: bool = False) -> HttpResponse:
+                            choose: bool = False, currencies: tuple[str, str] | None = None) -> HttpResponse:
     """Back to the onboarding wizard's Accounting step (3) with ``?xero=`` mismatch | conflict |
-    choose | connected | cancelled, the Xero organisation's name, the address to use on a mismatch,
-    and the company holding the organisation on a conflict (``conflict_can_move`` only when true:
-    the wizard reads its absence as "cannot move"). The wizard draws no flash: they are dropped."""
+    choose | currency | connected | cancelled, the Xero organisation's name, the address to use on a
+    mismatch, the company holding the organisation on a conflict (``conflict_can_move`` only when
+    true: the wizard reads its absence as "cannot move"), and on ``currency`` the organisation's
+    base currency (``xero_currency``) and the company's (``expected_currency``). The wizard draws no
+    flash: they are dropped."""
     for category, message in drain_flashes(request):
         (logger.warning if category in ("danger", "error") else logger.info)(
             "Flash dropped on the way to the onboarding wizard (%s): %s", category, message)
@@ -172,6 +174,8 @@ def _onboarding_xero_return(request: HttpRequest, connected: bool, org_name: str
         flag = "conflict"
     elif choose:
         flag = "choose"
+    elif currencies:
+        flag = "currency"
     elif connected:
         flag = "connected"
     else:
@@ -187,6 +191,8 @@ def _onboarding_xero_return(request: HttpRequest, connected: bool, org_name: str
         query["conflict_entity_id"] = conflict_entity_id
         if conflict_can_move:
             query["conflict_can_move"] = "1"
+    if flag == "currency":
+        query["xero_currency"], query["expected_currency"] = currencies
     return HttpResponseRedirect(f"{handoff_origin(request, 'onboarding', settings.ONBOARDING_WEB_URL)}/?"
                                 f"{urlencode(query)}")
 
@@ -640,12 +646,26 @@ def _connect(request: HttpRequest, code, error, from_onboarding: bool, entity_id
                                                conflict_entity_id=str(conflict.id),
                                                conflict_can_move=refusal["can_move"])
             return _to_list()
-        fy_end = connect.financial_year_end_or_revoke(grant.access_token, curr_conn, tenant_id, entity.id)
-        if fy_end is None:
+        facts = connect.organisation_facts_or_revoke(grant.access_token, curr_conn, tenant_id, entity.id)
+        if facts is None:
             return failed()
+        org_name = facts.name or curr_conn[0].get("tenantName") or ""
+        if refusal := connect.currency_refusal(entity, facts, org_name):
+            sentence, company_currency = refusal
+            logger.warning("Xero connect refused for entity %s: organisation %s is in %s, the company in %s",
+                           entity.id, tenant_id, facts.base_currency, company_currency)
+            connect.revoke_new_grant(grant.access_token, curr_conn, tenant_id)
+            if from_onboarding:
+                if company_currency:
+                    return _onboarding_xero_return(request, False, org_name,
+                                                   currencies=(facts.base_currency, company_currency))
+                return failed(sentence)
+            # A modal in minty-web, not a toast: a sentence this long, to act on, must stay up.
+            flash(request, sentence, "dialog")
+            return _to_list()
         try:
             # Mid-onboarding the status stays "onboarding" (only finalize clears it).
-            begins_matching = _record(entity, user, grant, tenant_id, curr_conn[0].get("tenantName"), fy_end,
+            begins_matching = _record(entity, user, grant, tenant_id, curr_conn[0].get("tenantName"), facts.year_end,
                                       status=None if from_onboarding else "connected")
         except MirrorFailed:
             connect.revoke_new_grant(grant.access_token, curr_conn, tenant_id)
@@ -746,18 +766,25 @@ def _reconnect(request: HttpRequest, code, error, entity_id: str, state_initiato
                                    tenant_id, conflict.id, conflict.name)
                     connect.revoke_new_grant(grant.access_token, curr_conn, tenant_id)
                     return _settings_tab(entity_id, xero_conflict=_refuse_conflict(request, conflict, user)["token"])
-                fy_end = connect.financial_year_end_or_revoke(grant.access_token, curr_conn, tenant_id, entity_id)
-                if fy_end is None:
+                facts = connect.organisation_facts_or_revoke(grant.access_token, curr_conn, tenant_id, entity_id)
+                if facts is None:
                     flash(request, RECONNECT_FAILED, "danger")
                     return _settings_tab(entity_id)
                 known = _uuid_text(entity_id)
                 entity = Entity.objects.filter(id=known, archived_at__isnull=True).first() if known else None
                 if entity is None:
                     raise LookupError(f"no entity {entity_id!r} to reconnect")
+                org_name = facts.name or curr_conn[0].get("tenantName") or ""
+                if refusal := connect.currency_refusal(entity, facts, org_name):
+                    logger.warning("Xero reconnect refused for entity %s: organisation %s is in %s, the company in %s",
+                                   entity.id, tenant_id, facts.base_currency, refusal[1])
+                    connect.revoke_new_grant(grant.access_token, curr_conn, tenant_id)
+                    flash(request, refusal[0], "dialog")  # minty-web's modal, as on a first connect
+                    return _settings_tab(entity_id)
                 old_org = entity.xero_org_id
                 try:
                     begins_matching = _record(entity, user, grant, tenant_id, curr_conn[0].get("tenantName"),
-                                              fy_end, status="connected")
+                                              facts.year_end, status="connected")
                 except MirrorFailed:
                     connect.revoke_new_grant(grant.access_token, curr_conn, tenant_id)
                     flash(request, RECONNECT_FAILED, "danger")

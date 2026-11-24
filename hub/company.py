@@ -61,6 +61,16 @@ NO_COMPANY = "You don't have access to that company."
 #: The roles a person may be given here, in the dropdown's order.
 ASSIGNABLE = ("admin", "accountant", "shop_manager", "cashier")
 CONNECTIONS_URL = "https://api.xero.com/connections"
+#: The user, 2026-11-24: a company connected to Xero keeps Xero's currency (checked at connect).
+CURRENCY_LOCKED = ("This company is connected to Xero, so its currency stays the same as Xero's. To change it, "
+                   "disconnect Xero first.")
+
+
+def currency_locked(org: Entity) -> bool:
+    """Connected to Xero for the currency lock: an organisation held and not disconnected - so a
+    wizard company that already linked Xero is locked, and one mid-matching or kept after a
+    disconnect is not (onboarding-api's ``xero_connected`` rule)."""
+    return bool(org.xero_org_id) and org.status != "disconnected"
 
 
 def _open(request: HttpRequest, permission: Permission, denied: str):
@@ -377,6 +387,7 @@ def _integration_page(user: User, entity_id: str) -> dict:
     return {
         "company": {"id": str(org.id), "name": org.name, "country_code": org.country_code,
                     "currency_id": str(org.currency_id) if org.currency_id else None},
+        "currency_locked": currency_locked(org),
         "modules": sorted(_modules([org.id]).get(str(org.id), set())),
         "countries": [{"code": c.country_code, "name": c.country_name_en}
                       for c in countries.distinct().order_by("display_order", "country_name_en")],
@@ -436,11 +447,16 @@ def _save_integration(request: HttpRequest, user: User, entity_id: str, data: di
     currency = CurrencyInfo.objects.filter(id=currency_id).first() if currency_id and _uuid(currency_id) else None
     if currency_id and currency is None:
         return refuse(request, "Pick one of the currencies offered.", 422)
+    if currency_locked(org):
+        # Connected to Xero: the currency stays Xero's; a country no longer brings its own.
+        if currency is not None and str(currency.id) != str(org.currency_id):
+            return refuse(request, CURRENCY_LOCKED, 409)
+        currency = None
+    elif currency is None and country is not None and country.currency_id:
+        currency = CurrencyInfo.objects.filter(id=country.currency_id).first()  # a country brings its own
     if country is not None:
         org.country_code = country.country_code
         changed.append("country_code")
-    if currency is None and country is not None and country.currency_id:
-        currency = CurrencyInfo.objects.filter(id=country.currency_id).first()  # a country brings its own
     try:
         with transaction.atomic():
             if currency is not None:

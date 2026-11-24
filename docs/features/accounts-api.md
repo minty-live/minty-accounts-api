@@ -265,6 +265,11 @@ keeps only the membership reads. The payer, pending-handover and only-admin guar
   - A save renames the company (admins only; names need not be unique, owner 2026-11-16; 422 sentences), and sets
     the country and currency. A country sent on its own brings its own currency, and the company's
     notes and coins follow the currency (`hub/cash_settings.py`, onboarding-api's copy).
+  - **The currency is locked while the company is connected to Xero** (the user, 2026-11-24;
+    `currency_locked` on the page: an organisation held and status not `disconnected`, so a wizard
+    company that linked Xero is locked and one mid-matching or kept after a disconnect is not). A
+    different currency is a 409 (`CURRENCY_LOCKED`: "…so its currency stays the same as Xero's. To
+    change it, disconnect Xero first."), and a country no longer brings its own currency.
   - A failed save is a 500 and changes nothing.
   - `?xero_conflict=` names the company holding the organisation; "move it here" is offered only in
     development.
@@ -362,6 +367,17 @@ not issue before exchanging the code. Two more changes from Flask:
   nothing and left it live). The onboarding wizard sees `xero=cancelled`, as for other failures.
 - `/callback` is open past the Terms gate. Its start routes stay gated, so only a flow begun while
   agreed lands, and a Terms change mid-connect no longer throws away what Xero granted.
+- **The company's currency must be the organisation's base currency** (the user, 2026-11-24).
+  `connect.organisation_facts` reads the year end, `BaseCurrency` and name from the one
+  `/Organisation` call; no base currency fails the connect like no year end. `currency_refusal`
+  then refuses (grant handed back, nothing written) with what to change - Minty never switches the
+  currency, and Xero can't change a base currency: "{org} uses USD in Xero, but {company} uses HKD
+  in Minty, so it wasn't connected. Change the company's currency to USD in Settings, under General,
+  or connect a Xero organisation that uses HKD." A company with no currency is told to choose one.
+  Connect and reconnect flash the sentence as category `dialog` (`hub/notices.py` keeps it), which
+  minty-web draws as a one-button modal (`NoticeDialog`) instead of a 4 s toast; the wizard gets `xero=currency&xero_currency=USD&
+  expected_currency=HKD&org=…` (no currency there is `xero=cancelled`: the wizard asks for one at
+  step 1).
 
 Like Flask, the id_token's signature is not checked against Xero's keys: the token comes straight
 from Xero's token endpoint over TLS, in exchange for the code and the client secret.

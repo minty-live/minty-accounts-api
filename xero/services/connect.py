@@ -17,8 +17,10 @@ the Flask retirement, 2026-11-06). The routes are ``hub/xero_oauth.py``.
   token and, when the grant is gone or can't be checked, reconciled as a ghost.
 - **Handing a grant back** (``revoke_new_grant``, ``revoke_whole_auth_event``) when a connect is
   refused after Xero already made the grant. Best effort, logged.
-- **The financial year end and the mirror**: a connection must carry Xero's year end, and every
-  connect makes the cached chart and contacts match the organisation picked (owner, 2026-11-03).
+- **The financial year end, the currency and the mirror**: a connection must carry Xero's year end
+  and base currency, the company's currency must be that base currency (``currency_refusal``; the
+  user, 2026-11-24), and every connect makes the cached chart and contacts match the organisation
+  picked (owner, 2026-11-03).
   The mirror runs inside the caller's transaction, beside the company's write.
 - **The connect-time sync** (``background_sync``, on a thread): the one sync's fetch and apply
   (``xero/services/sync.py``), plus what only a connect does - contacts Xero no longer has are
@@ -37,7 +39,7 @@ from django.conf import settings
 from django.db import connection, transaction
 from django.db.models import Q
 from django.utils import timezone
-from minty_db.models import AccountInfo, Entity, User, UserToken, XeroContactSync
+from minty_db.models import AccountInfo, CurrencyInfo, Entity, User, UserToken, XeroContactSync
 
 from xero.services import sync, usage
 from xero.services.tokens import TOKEN_URL, XERO_TIMEOUT, refresh_lock, resolve_entity_access_token
@@ -299,11 +301,20 @@ def unclaimed_connections(connections) -> list:
     return [c for c in connections or [] if c.get("tenantId")]
 
 
-# ---- the financial year end and the mirror ------------------------------------------------------
+# ---- the financial year end, the currency and the mirror ----------------------------------------
 
 
-def financial_year_end(access_token, tenant_id) -> tuple[int, int]:
-    """``(day, month)`` from Xero's Organisation. Raises on any failure."""
+@dataclass(frozen=True)
+class OrganisationFacts:
+    """What a connect needs from Xero's Organisation: the year end and the base currency."""
+
+    year_end: tuple[int, int]  # (day, month)
+    base_currency: str  # ISO code, upper case
+    name: str
+
+
+def organisation_facts(access_token, tenant_id) -> OrganisationFacts:
+    """The year end, base currency and name from Xero's Organisation. Raises on any failure."""
     response = requests.get(f"{settings.XERO_API_BASE_URL}/Organisation", timeout=15, headers={
         **_bearer(access_token), "Xero-Tenant-Id": str(tenant_id), "Accept": "application/json"})
     logger.info("Xero Organisation: status=%s org=%s", response.status_code, tenant_id)
@@ -316,18 +327,39 @@ def financial_year_end(access_token, tenant_id) -> tuple[int, int]:
     day, month = org.get("FinancialYearEndDay"), org.get("FinancialYearEndMonth")
     if not (isinstance(day, int) and isinstance(month, int) and 1 <= day <= 31 and 1 <= month <= 12):
         raise RuntimeError(f"Xero Organisation has no usable financial year end: {day!r}/{month!r}")
-    return day, month
+    base_currency = str(org.get("BaseCurrency") or "").strip().upper()
+    if not base_currency:
+        raise RuntimeError("Xero Organisation has no base currency")
+    return OrganisationFacts((day, month), base_currency, str(org.get("Name") or "").strip())
 
 
-def financial_year_end_or_revoke(access_token, connections, tenant_id, entity_id) -> tuple[int, int] | None:
-    """The year end, or None after handing the grant back (a connection must carry it)."""
+def organisation_facts_or_revoke(access_token, connections, tenant_id, entity_id) -> OrganisationFacts | None:
+    """The organisation's facts, or None after handing the grant back (a connection must carry them)."""
     try:
-        return financial_year_end(access_token, tenant_id)
+        return organisation_facts(access_token, tenant_id)
     except Exception as err:  # noqa: BLE001 - the connect fails, loudly
-        logger.error("Xero connect failed: no financial year end for entity %s (tenant %s): %s", entity_id,
+        logger.error("Xero connect failed: no year end or base currency for entity %s (tenant %s): %s", entity_id,
                      tenant_id, err)
         revoke_new_grant(access_token, connections, tenant_id)
         return None
+
+
+def currency_refusal(entity: Entity, facts: OrganisationFacts, org_name: str) -> tuple[str, str | None] | None:
+    """Why the company's currency stops it connecting to this organisation (the user, 2026-11-24:
+    Minty never switches it, it says what to change - Xero's base currency can't be changed), as
+    ``(sentence, the company's code or None)``; None when they agree."""
+    code = (CurrencyInfo.objects.filter(id=entity.currency_id).values_list("currency_code", flat=True).first()
+            if entity.currency_id else None)
+    code = (code or "").strip().upper() or None
+    if code is None:
+        return (f"{entity.name} has no currency yet, so Xero wasn't connected. Choose the currency in Settings, "
+                "under General, then connect again."), None
+    if code == facts.base_currency:
+        return None
+    xero = facts.base_currency
+    return (f"{org_name or 'That Xero organisation'} uses {xero} in Xero, but {entity.name} uses {code} in Minty, "
+            f"so it wasn't connected. Change the company's currency to {xero} in Settings, under General, or connect "
+            f"a Xero organisation that uses {code}."), code
 
 
 class MirrorFailed(Exception):

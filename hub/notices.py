@@ -27,10 +27,12 @@ MAX_NOTICE_LENGTH = 500
 
 
 def _category(raw: str) -> str:
-    """Flask's flash category as minty-web's toast reads it."""
+    """Flask's flash category as minty-web's toast reads it - or ``dialog``, a refusal the person
+    must read and act on, which minty-web draws as a one-button modal instead (the Xero currency
+    refusal, 2026-11-24)."""
     if raw in ("error", "danger"):
         return "error"
-    if raw in ("warning", "info"):
+    if raw in ("warning", "info", "dialog"):
         return raw
     return "success"
 

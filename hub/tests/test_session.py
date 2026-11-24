@@ -110,6 +110,10 @@ def test_flashes_wait_in_the_session_until_drained_and_sign_into_what_the_hub_re
     assert notices.read_notices(notices.sign_notices(drained)) == [
         {"category": "success", "message": "You're connected to Xero!"}, {"category": "error", "message": "Hmm."}]
     assert notices.sign_notices([("info", "  ")]) is None
+    # A refusal the person must read and act on (the Xero currency one, 2026-11-24): minty-web
+    # draws it as a modal, so its category survives the trip.
+    assert notices.read_notices(notices.sign_notices([("dialog", "Change the currency.")])) == [
+        {"category": "dialog", "message": "Change the currency."}]
     assert notices.read_conflict(notices.sign_conflict("e-1", "Other Co", True)) == {
         "entity_id": "e-1", "entity_name": "Other Co", "can_move": True}
 

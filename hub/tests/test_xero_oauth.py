@@ -24,6 +24,7 @@ from django.db import connection
 from django.test import Client
 from minty_db.models import (
     AccountInfo,
+    CurrencyInfo,
     Entity,
     EntityAccountXero,
     EntityBillAccountXero,
@@ -37,6 +38,7 @@ from minty_db.models import (
 
 from hub import registry, xero_oauth
 from hub.notices import read_conflict
+from hub.tests.test_company import currency
 from hub.tests.test_handoffs import login
 from hub.tests.test_public_and_transport import make_user
 from xero.services import connect, sync
@@ -76,6 +78,7 @@ class Xero:
         self.granted = [{"id": "conn-1", "tenantId": "t-1", "tenantName": "Acme Ltd"}]
         self.visible = None
         self.year_end = {"FinancialYearEndDay": 31, "FinancialYearEndMonth": 3}
+        self.base_currency = "HKD"  # None = the Organisation answer carries no BaseCurrency
         self.accounts = list(NEW_ACCOUNTS)
         self.contacts = [{"ContactID": "new-c1", "Name": "New Supplier"}]
         self.tokens, self.sees, self.probe_status = {}, {}, {}
@@ -122,7 +125,9 @@ class Xero:
         if url.endswith("/Organisation"):
             if self.year_end is None:
                 return Answer(500, {"Title": "error"})
-            return Answer(200, {"Organisations": [{"OrganisationID": headers["Xero-Tenant-Id"], **self.year_end}]})
+            currency = {"BaseCurrency": self.base_currency} if self.base_currency else {}
+            return Answer(200, {"Organisations": [{"OrganisationID": headers["Xero-Tenant-Id"], **self.year_end,
+                                                   **currency}]})
         if url.endswith("/Accounts"):
             return Answer(200, {"Accounts": self.accounts})
         if url.endswith("/Contacts"):
@@ -162,15 +167,17 @@ def agree(user) -> None:
 
 @pytest.fixture
 def shop(db):
-    """Olive & Vine (no Xero yet) with its admin, and OldCo held by someone else."""
+    """Olive & Vine (no Xero yet, in HKD, as the fake Xero organisation is) with its admin, and OldCo
+    held by someone else."""
+    hkd = currency()
     owner = make_user("owner@test.com")
     agree(owner)
-    entity = Entity.objects.create(id=uuid.uuid4(), name="Olive & Vine", status="disconnected")
+    entity = Entity.objects.create(id=uuid.uuid4(), name="Olive & Vine", status="disconnected", currency_id=hkd.id)
     UserEntity.objects.create(user_id=owner.id, entity_id=entity.id, role="admin", approved=True)
     rival = make_user("rival@test.com")
-    old = Entity.objects.create(id=uuid.uuid4(), name="OldCo", status="connected")
+    old = Entity.objects.create(id=uuid.uuid4(), name="OldCo", status="connected", currency_id=hkd.id)
     UserEntity.objects.create(user_id=rival.id, entity_id=old.id, role="admin", approved=True)
-    return {"owner": owner, "entity": entity, "rival": rival, "old": old}
+    return {"owner": owner, "entity": entity, "rival": rival, "old": old, "hkd": hkd}
 
 
 def signed_in(user) -> Client:
@@ -510,7 +517,8 @@ def test_an_onboarding_connect_keeps_the_company_onboarding_and_goes_back_to_the
 def test_each_persons_callback_connects_their_own_company(shop, xero):
     """The race the state's id fixed: the newest company is never taken for someone else's."""
     alice, bob = shop["owner"], make_user("bob@test.com")
-    mine, theirs = shop["entity"], Entity.objects.create(id=uuid.uuid4(), name="Bob Ltd", status="disconnected")
+    mine, theirs = shop["entity"], Entity.objects.create(id=uuid.uuid4(), name="Bob Ltd", status="disconnected",
+                                                         currency_id=shop["hkd"].id)
     UserEntity.objects.create(user_id=bob.id, entity_id=theirs.id, role="admin", approved=True)
     a, b = signed_in(alice), signed_in(bob)
     state_a, state_b = connect_flow(a, mine), connect_flow(b, theirs)
@@ -548,7 +556,7 @@ def test_a_cashier_cannot_connect_their_company(shop, xero):
 
 def test_onboarding_without_an_id_finds_the_persons_own_company_by_name(shop, xero):
     owner = shop["owner"]
-    mine = Entity.objects.create(id=uuid.uuid4(), name="Vine Two", status="onboarding",
+    mine = Entity.objects.create(id=uuid.uuid4(), name="Vine Two", status="onboarding", currency_id=shop["hkd"].id,
                                  created_at=datetime(2026, 1, 1, tzinfo=UTC))
     newer = Entity.objects.create(id=uuid.uuid4(), name="Vine Three", status="onboarding",
                                   created_at=datetime(2026, 2, 1, tzinfo=UTC))
@@ -579,6 +587,57 @@ def test_no_financial_year_end_fails_the_connect_and_hands_the_grant_back(shop, 
     assert fresh(shop["entity"]).xero_org_id is None
     assert xero.deleted == [f"{connect.CONNECTIONS_URL}/conn-1"]
     assert not UserToken.objects.filter(user_id=shop["owner"].id).exists()
+
+
+MISMATCH = ("Acme Ltd uses USD in Xero, but Olive & Vine uses HKD in Minty, so it wasn't connected. Change the "
+            "company's currency to USD in Settings, under General, or connect a Xero organisation that uses HKD.")
+
+
+def refused_and_handed_back(shop, xero):
+    assert fresh(shop["entity"]).xero_org_id is None and fresh(shop["entity"]).status != "connected"
+    assert xero.deleted == [f"{connect.CONNECTIONS_URL}/conn-1"] and xero.syncs == []
+    assert not UserToken.objects.filter(user_id=shop["owner"].id).exists()
+
+
+def test_an_organisation_in_another_currency_is_not_connected_and_says_what_to_change(shop, xero):
+    """The user, 2026-11-24: Minty never switches the currency; it says what to change."""
+    xero.base_currency = "USD"
+    client = signed_in(shop["owner"])
+    resp = callback(client, connect_flow(client, shop["entity"]))
+    assert resp["Location"] == "/entity" and flashes(client) == [("dialog", MISMATCH)]
+    refused_and_handed_back(shop, xero)
+
+
+def test_the_wizard_hears_of_another_currency_by_its_own_flag(shop, xero):
+    xero.base_currency = "usd"  # read as its upper-case code
+    Entity.objects.filter(id=shop["entity"].id).update(status="onboarding")
+    client = signed_in(shop["owner"])
+    resp = callback(client, connect_flow(client, shop["entity"], **{"from": "onboarding"}))
+    assert onboarding_answer(resp) == {"xero": "currency", "step": "3", "org": "Acme Ltd", "xero_currency": "USD",
+                                       "expected_currency": "HKD"}
+    refused_and_handed_back(shop, xero)
+    assert fresh(shop["entity"]).status == "onboarding"
+
+
+@pytest.mark.parametrize("onboarding", [False, True])
+def test_a_company_with_no_currency_is_not_connected(shop, xero, onboarding):
+    Entity.objects.filter(id=shop["entity"].id).update(currency_id=None)
+    client = signed_in(shop["owner"])
+    resp = callback(client, connect_flow(client, shop["entity"], **({"from": "onboarding"} if onboarding else {})))
+    if onboarding:  # the wizard asks for a currency at step 1, so this is an old company: no flag of its own
+        assert onboarding_answer(resp)["xero"] == "cancelled"
+    else:
+        assert flashes(client) == [("dialog", "Olive & Vine has no currency yet, so Xero wasn't connected. Choose "
+                                              "the currency in Settings, under General, then connect again.")]
+    refused_and_handed_back(shop, xero)
+
+
+def test_an_organisation_answer_without_a_base_currency_fails_the_connect(shop, xero):
+    xero.base_currency = None
+    client = signed_in(shop["owner"])
+    callback(client, connect_flow(client, shop["entity"]))
+    assert xero_oauth.CONNECT_FAILED in said(client)
+    refused_and_handed_back(shop, xero)
 
 
 def test_no_chart_from_xero_refuses_the_connect_changes_nothing_and_hands_the_grant_back(shop, xero):
@@ -637,7 +696,8 @@ def test_the_wrong_xero_login_from_onboarding_says_mismatch(shop, xero):
 
 
 def _onboarding_company(owner, name):
-    company = Entity.objects.create(id=uuid.uuid4(), name=name, status="onboarding")
+    hkd = CurrencyInfo.objects.get(currency_code="HKD")
+    company = Entity.objects.create(id=uuid.uuid4(), name=name, status="onboarding", currency_id=hkd.id)
     UserEntity.objects.create(user_id=owner.id, entity_id=company.id, role="admin", approved=True)
     return company
 
@@ -878,6 +938,16 @@ def test_a_reconnect_without_a_year_end_or_a_chart_stays_disconnected(shop, xero
         assert fresh(entity).xero_org_id is None and fresh(entity).status == "disconnected"
         xero.year_end, xero.accounts = {"FinancialYearEndDay": 31, "FinancialYearEndMonth": 3}, list(NEW_ACCOUNTS)
     assert xero.deleted == [f"{connect.CONNECTIONS_URL}/conn-1"] * 2
+
+
+def test_a_reconnect_to_an_organisation_in_another_currency_stays_disconnected(shop, xero):
+    entity = shop["entity"]
+    xero.base_currency = "USD"
+    client = signed_in(shop["owner"])
+    resp = callback(client, reconnect_flow(client, entity))
+    assert resp["Location"] == settings_tab(entity) and flashes(client) == [("dialog", MISMATCH)]
+    assert fresh(entity).xero_org_id is None and fresh(entity).status == "disconnected"
+    assert xero.deleted == [f"{connect.CONNECTIONS_URL}/conn-1"] and xero.syncs == []
 
 
 def test_a_reconnect_with_the_wrong_xero_login_or_declined(shop, xero):
