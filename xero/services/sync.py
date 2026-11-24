@@ -17,6 +17,10 @@ times each time Petty Cash Settings opened; this asks once and does all of it:
   touched. One exception for daily closing's accounts (2026-11-13): when Xero REPLACED the account
   (one active account of the same code and type, a new AccountID), the settings move to it
   (``_repoint_replaced_settings``); expense and bill lines stay on the archived row.
+- Every overwrite is logged (the user, 2026-11-24): a refresh writes ``account_change_log`` kind
+  ``overwritten`` (Xero's code, name and type before and after, ``changed_by`` NULL), and a Minty
+  account Xero takes over by code and type ``linked``. Xero's code goes in ``xero_code``; the Minty
+  code (``code``) stays - the schema fills it from Xero's only while it is empty (minty-db v0.18).
 - ``entity_account_xero`` (Petty Cash's code list) gains a row per eligible account; the ticks
   (``is_active``) are never changed here.
 - ``entity_bill_account_xero`` (Payment Requests' list) likewise, and loses rows whose account is gone.
@@ -38,6 +42,7 @@ Flask's own syncs while both exist.
 from __future__ import annotations
 
 import logging
+import uuid
 from datetime import timedelta
 
 import requests
@@ -45,6 +50,7 @@ from django.conf import settings
 from django.db import IntegrityError, connection, models, transaction
 from django.utils import timezone
 from minty_db.models import (
+    AccountChangeLog,
     AccountInfo,
     EntityAccountXero,
     EntityBillAccountXero,
@@ -137,9 +143,27 @@ def _status(account: dict) -> str:
     return str(raw).strip().upper() if raw is not None and str(raw).strip() else "ACTIVE"
 
 
+def _log_code(code) -> str | None:
+    """A code as account_change_log holds it (10 characters): longer is a name, not a code."""
+    code = str(code or "").strip()
+    return code if 0 < len(code) <= 10 else None
+
+
+def _log(entity_id, row: AccountInfo, kind: str, before: tuple, batch, org) -> None:
+    """One line of ``account_change_log`` for what the sync changed (``changed_by`` NULL)."""
+    row.refresh_from_db(fields=["account_type"])
+    AccountChangeLog.objects.create(
+        entity_id=entity_id, account_id=row.id, batch_id=batch, kind=kind, before_code=_log_code(before[0]),
+        before_name=(before[1] or None) and before[1][:150], before_type=before[2],
+        after_code=_log_code(row.xero_code), after_name=row.name[:150] if row.name else None,
+        after_type=row.account_type, xero_org_id=str(org) if org else None, xero_guid=row.xero_account_id,
+    )
+
+
 def apply_accounts(entity_id, accounts: list[dict], org) -> dict:
     """Make the company's account tables match Xero's ACTIVE ``accounts`` (non-empty)."""
     counts = {"added": 0, "linked": 0, "activated": 0, "refreshed": 0, "archived": 0, "deleted": 0}
+    batch = uuid.uuid4()
     with transaction.atomic():
         lock(entity_id)
         snapshot = {a["AccountID"]: a for a in accounts if a.get("AccountID")}
@@ -173,8 +197,11 @@ def apply_accounts(entity_id, accounts: list[dict], org) -> dict:
             if row is None:
                 mine = own.pop((str(account.get("Code") or "").strip(), account.get("Type")), None)
                 if mine is not None:
+                    before = (mine.xero_code, mine.name, mine.account_type)
                     mine.xero_account_id, mine.status = account_id, "ACTIVE"
-                    mine.save(update_fields=["xero_account_id", "status"])
+                    mine.xero_code = _trunc(account.get("Code", ""), 50)
+                    mine.save(update_fields=["xero_account_id", "status", "xero_code"])
+                    _log(entity_id, mine, "linked", before, batch, org)
                     counts["linked"] += 1
                     continue
                 try:
@@ -198,15 +225,19 @@ def apply_accounts(entity_id, accounts: list[dict], org) -> dict:
                 changed.append("status")
                 counts["activated"] += 1
             code = str(account.get("Code") or "").strip()
+            before = (row.xero_code, row.name, row.account_type)
             if account.get("Type") not in COA_EXCLUDED_TYPES and code:
-                for field, value in (("name", account.get("Name", row.name)), ("type", account.get("Type", row.type)),
-                                     ("xero_code", code)):
+                # cut to what Minty holds: Xero's names run to 150 (a long one failed the whole sync)
+                for field, value in (("name", _trunc(account.get("Name", row.name), 80) or row.name),
+                                     ("type", _trunc(account.get("Type", row.type), 50) or row.type),
+                                     ("xero_code", _trunc(code, 50))):
                     if getattr(row, field) != value:
                         setattr(row, field, value)
                         changed.append(field)
             if changed:
                 row.save(update_fields=sorted(set(changed)))
                 if set(changed) - {"status"}:
+                    _log(entity_id, row, "overwritten", before, batch, org)
                     counts["refreshed"] += 1
                     renamed.append(row.id)
         # a rename in Xero shows on every bill (the user's rule, 2026-11-24)

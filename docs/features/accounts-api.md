@@ -458,43 +458,70 @@ pointing at nothing.
   `/settings/integration/match` (accounts-api's `settings_integration_match` redirect). No background
   sync yet; `_sync_connection` never marks such a company connected (`matching.pending`).
 - **The page** (`hub/xero_matching.py` over `xero/services/matching.py`, `XERO_SETTINGS_VIEW` to read,
-  `XERO_SETTINGS_UPDATE` otherwise): `GET /api/me/company/xero/matching` (rows by group, each with its
-  pick, a suggestion - a bank by its number, else the same type with a similar name - a same-code
-  other-type conflict, whether a record uses it), `PATCH` `{account_id, xero_account_id | null}` (one pick;
-  saved at once; a bank only to a bank, else the same class; daily closing's petty cash and bank never
-  one Xero account - refused here and at Finish, `matching.SAME_BANK`), `POST .../refresh` (Xero's accounts again; `{"throttle": true}`, the page opening, skips Xero when the chart was read under `SETTINGS_READ_EVERY`; the GET adds `can_edit`),
-  `POST .../finish`, `POST .../contacts`.
+  `XERO_SETTINGS_UPDATE` otherwise): `GET /api/me/company/xero/matching`. The answer:
+  - the accounts still to match first (group `unmatched`, "Not matched yet", in the groups' order, then
+    by code), then the matched ones in their groups;
+  - each row with its group, its pick, a suggestion (a bank by its number, else the same type with a
+    similar name, never one another account has), a same-code other-type conflict, and whether a record
+    uses it;
+  - the Xero accounts to pick from, each with `held_by` (the account that has it);
+  - `blocking` (accounts with no pick) and `contacts` (the contacts step, below).
+
+  The other routes:
+  - `PATCH` `{account_id, xero_account_id | null}`: one pick, saved at once. A bank only to a bank, else
+    the same class. Daily closing's petty cash and bank are never one Xero account (`matching.SAME_BANK`).
+    A Xero account another account picked is refused (409 `matching.TAKEN_PICK`).
+  - `PATCH .../contacts` `{contact_id | slot, xero_contact_id | null, new}`: one answer of the contacts step.
+  - `POST .../refresh`: Xero's accounts and contacts again. `{"throttle": true}` (the page opening) skips
+    Xero when the chart was read under `SETTINGS_READ_EVERY`; the GET adds `can_edit`.
+  - `POST .../finish` and `POST .../contacts`.
+- **Every account needs its own Xero account** (the user, 2026-11-24):
+  - Used or not, every account needs a match, so nothing is archived at Finish.
+  - Accounts are never merged, so two can't share a Xero account (`account_match_draft`'s
+    `uq_account_match_draft_xero`, minty-db v0.18).
+  - An account with no counterpart is added in Xero, then Refresh (Minty never creates accounts there, A1).
 - **Used** (`xero/services/usage.py`, owner 2026-11-11, extending the doc's Q8): an expense line, a bill
   line (by id, or by code on an older line), any daily-closing account, or an account combined into it.
   (A sales method named an account for a day, minty-db's unreleased v0.6; withdrawn the same day.)
-- **Finish = the replace**, one transaction: 409 while a used account has no pick (or a pick names a
-  Xero account that is gone, or one already linked here); accounts picked to one Xero account combined
-  (survivor: Xero's code, else most records, else oldest; expenses, bill lines, daily closing, sales
-  methods, `account_module`, `entity_account_xero` re-pointed; the others archived with
-  `merged_into_id`); each picked account takes Xero's identity IN PLACE (Xero id, code, name, type, link)
-  so every reference stays, gets a Petty Cash module row if it had none (X2/X3's tick), and its bill code
-  and every bill line on it, published ones included, follow (a line saved with only the old code gets
-  the id; each line takes the account's code and name, its bill the header code - `bill_text`, the
-  user's rule 2026-11-24; nothing goes to Xero) (combined accounts' bill codes become one - the
-  survivor's, carrying the default - as `uq_ebax_entity_xero_account` allows one per Xero account;
-  two of them failed every Finish until 2026-11-13); unused unmatched accounts archived (never deleted); all
-  logged in `account_change_log` (one batch); drafts deleted; `setup_mode = 'xero'` and
-  `xero_publish_from` = today (Hong Kong; the day Finish ran, no longer a publish cut-off: owner 2026-11-18, any record publishes once Xero is connected).
-- **Suppliers** (after the replace commits): each own supplier linked to the Xero contact of its name
-  (case, spaces and punctuation ignored - `minty_shared.names`, the user 2026-11-23: "7 Eleven" is "7-Eleven"; the active one first, else the first by Xero id -
-  the doc's Q9 default); one already stored here is merged into it. Logged in `contact_change_log`.
-  **Connecting creates nothing in Xero** (owner's decisions doc C2, 2026-11-19): a supplier with no
-  Xero contact of its name stays in Minty and goes to Xero at its first publish (C1), so Finish
-  connects the company straight away and starts the first sync. `POST .../contacts` (Try again) is
-  left for a company the old rule (before 2026-11-19: disconnected until every supplier was in Xero)
-  still holds disconnected: it links by name and connects it.
-- **Daily closing's contacts** (production, 2026-11-23): Minty's own books need none, Xero's need three
-  (petty-cash-api `xero_settings.PETTYCASH_SLOTS`), so a company that finished matching had Publish
-  refused ("Xero settings incomplete"). Finish's answer (and Try again's) carries
-  `pettycash_contacts_missing` (`matching.pettycash_contacts_missing`): the keys `cash_sale`,
-  `director`, `discrepancy` still empty in `entity_pettycash_settings` - no `cash_sale` when the
-  company banks every sale (`uses_sales_cash = false`), `[]` without a settings row. minty-web then asks
-  whether to open Petty Cash Settings. Finish writes nothing for them.
+- **Finish = the replace**, one transaction.
+  - **Refused (409)** while any account has no pick (`UNMATCHED`), two share a Xero account (`SHARED`),
+    a pick names a Xero account or contact that is gone, or one already linked here, or the contacts
+    step has an answer missing (`CONTACTS_UNMATCHED`).
+  - **Each picked account takes Xero's link, Xero code, name and type IN PLACE**, so every reference stays.
+    Its Minty code (`code`) stays beside the Xero code (`xero_code`; the user, 2026-11-24 - Minty Code +
+    Xero Code, minty-db v0.18 keeps the trigger from overwriting it).
+  - **Its bill codes and bill lines follow.** It gets a Petty Cash module row if it had none (X2/X3's
+    tick). Its bill code and every bill line on it, published ones included, follow: a line saved with
+    only the old code gets the id, each line takes the account's code and name, and its bill the header
+    code (`bill_text`, the user's rule 2026-11-24; nothing goes to Xero).
+  - **Logged and closed.** Everything is logged in `account_change_log` (one batch; an unchanged match
+    writes nothing). The drafts are deleted, `setup_mode = 'xero'`, and `xero_publish_from` = today (Hong
+    Kong; the day Finish ran, no longer a publish cut-off: owner 2026-11-18, any record publishes once
+    Xero is connected).
+  - **The contacts step's answers go in with it, and the company is connected** at once, with the
+    first sync started.
+- **The contacts step** (the user, 2026-11-24: a step before Finish, replacing the warning after it;
+  `contact_match_draft`, minty-db v0.18). `contacts` in the page holds:
+  - each supplier not yet in the organisation (`own_suppliers`): its Xero contact, picked for it when
+    one has its name (case, spaces and punctuation ignored - `minty_shared.names`), or `new`, meaning
+    Minty puts it in Xero at its first publish (C1);
+  - each daily-closing contact still empty (`slots`: `cash_sale`, `director`, `discrepancy` - no
+    `cash_sale` when every sale is banked, none without a settings row; Xero's books need them,
+    petty-cash-api `xero_settings.PETTYCASH_SLOTS`), which always takes a Xero contact;
+  - the Xero contacts to pick from (active copies), and `blocking`.
+
+  At Finish:
+  - A supplier is linked (`contact_change_log`). When another Minty contact already has its Xero
+    contact, it is merged into that one (contacts still merge). One held by a deleted contact is
+    refused (`merge.TAKEN_BY_ARCHIVED`).
+  - A slot is set to its Xero contact's row, made from the copy when there is none.
+  - **Connecting creates nothing in Xero** (owner's decisions doc C2, 2026-11-19).
+  - A change of the matches asks no contacts (`required: false`).
+  - `POST .../contacts` (Try again) is left for a company the old rules (before 2026-11-19) still hold
+    disconnected: it links by name and connects it.
+- **Daily closing's contacts** (production, 2026-11-23): a Minty company's daily closing had none, and
+  Publish refused after Finish. They are the contacts step's now. Finish's answer still carries
+  `pettycash_contacts_missing` (`[]` after the step).
 - **The sync never deletes what is used or Minty-made** (also 2026-11-11): `sync.apply_accounts`
   archives a used (or Minty-made) account Xero dropped and leaves rows with no Xero id alone;
   `_mirror_bills` keeps bill codes with no Xero id; the connect's contact clean-up and
@@ -504,16 +531,17 @@ pointing at nothing.
   pending check reads it. A connect decides (`needs_matching(entity, tenant)`): another organisation
   than the one recorded → `new_org`, matched from scratch (copies + automatic picks only; nothing
   mirrored, archived or deleted before Finish; this used to mirror the new chart over the old one);
-  the same organisation with accounts made in Minty meanwhile → `new_accounts`, those alone. The
-  scope (`scope_accounts`) is every active account not linked to the current organisation (all of
-  them for `change`). **Change matches**: `POST .../matching/change` (connected, `XERO_SETTINGS_UPDATE`)
+  the same organisation with an account not linked yet (made in Minty meanwhile) → `new_accounts`. The
+  scope (`scope_accounts`) is every active account (the user, 2026-11-24: a reconnect shows them all;
+  the ones linked to the current organisation prefilled - `_prefill_links`); `first` is the company's
+  own accounts. **Change matches**: `POST .../matching/change` (connected, `XERO_SETTINGS_UPDATE`)
   prefills a pick per account; `POST .../matching/cancel` leaves it, nothing changed; the company stays
   connected and publishing goes on. Finish relinks only what changed (two accounts may swap: the
   changed ones let go of their Xero id first, as `uq_account_entity_xero` isn't deferrable), clears
   the marker, resets `xero_publish_from` to today for `first`/`new_org` and keeps it for
   `new_accounts`/`change` (a record of when Finish ran, no longer a publish cut-off);
-  a change's Finish skips the suppliers step (nothing created in Xero). Suppliers of another
-  organisation are linked by `link_suppliers` after a new organisation's Finish. While any matching is
+  a change asks no contacts (nothing created in Xero). Suppliers of another organisation are the
+  contacts step's after a new organisation's connect. While any matching is
   open the sync refreshes only the copies. Tests: `hub/tests/test_xero_matching.py`,
   `test_xero_oauth.py` (`test_a_minty_companys_connect_keeps_every_account_and_goes_to_matching`),
   `xero/tests/test_sync.py` (the archive-not-delete cases); Postgres only.
@@ -552,25 +580,32 @@ does the same before forwarding: `hub/company_chart.py` reads a connected compan
 throttled the same way; Xero failing leaves the stored list, logged. Tests: `xero/tests/test_sync.py`,
 `hub/tests/test_company_chart.py`.
 
-## Merging, relinking and mapping one account (the owner's decisions doc, 2026-11-19)
+## Merging contacts, relinking and mapping one account (the owner's decisions doc, 2026-11-19)
 
 The doc "Minty Xero Sync & Report Decisions" (claude.ai artifact HV37p5LpnzconZBJEUD31n) sets these.
+**Accounts are never merged (the user, 2026-11-24):** each matches its own Xero account; the account
+Merge (route, `merge_accounts`, `combine_accounts`) is gone. Accounts merged before then keep
+`merged_into_id` and their merging-table rows, and every reader still follows them.
 
-- **The one merge (M1-M4), `xero/services/merge.py`.** `combine_accounts` / `combine_contacts` move
-  every record of the merged one to the kept one (expenses, bill lines, bills, daily closing's slots,
-  `account_module`, `entity_account_xero`; every bill line on the kept account, published or not, then
-  takes its code and name and its bill the header code, and a kept contact's bills its name -
-  `xero/services/bill_text.py`, the user's rule 2026-11-24; a
-  Settings merge also takes the merged account's bill code off Payment Settings), archive it with
-  `merged_into_id` and write `minty_merge` plus a `minty_merge_record` per moved row (minty-db v0.14)
-  besides the change logs. No new record, Xero not touched, no undo. Matching's Finish runs them
-  (`_combine`, `_merge_supplier`; reason `xero_matching`).
-- **Settings Merge**: `POST /api/me/company/{accounts|contacts}/<id>/merge {"into"}` (`hub/company_chart.py`,
-  handled here, not forwarded; `COA_DELETE`) -> `merge_accounts` / `merge_contacts`: same company, both
-  active, the kept one never merged away; accounts of one class only and never a daily-closing system
-  account merged away (the user's additions, 2026-11-19). 200 `{message, moved}`.
+- **The one merge (M1-M4), `xero/services/merge.py`.** `combine_contacts` moves every record of the
+  merged contact to the kept one (expenses, bills, daily closing's slots; a kept contact's bills take
+  its name - `xero/services/bill_text.py`, the user's rule 2026-11-24), archives it with
+  `merged_into_id` and writes `minty_merge` plus a `minty_merge_record` per moved row (minty-db v0.14)
+  besides `contact_change_log`. No new record, Xero not touched, no undo. Matching's Finish runs it
+  (`_merge_supplier`; reason `xero_matching`).
+- **Settings Merge (contacts only)**: `POST /api/me/company/contacts/<id>/merge {"into"}`
+  (`hub/company_chart.py`, handled here, not forwarded; `COA_DELETE`) -> `merge_contacts`: same company,
+  both active, the kept one never merged away. 200 `{message, moved}`. `POST .../accounts/<id>/merge` is 404.
 - **The sync keeps merged rows**: `apply_accounts` never touches a row with `merged_into_id` (it used to
   delete a merged-away Xero account Xero dropped, and its log with it).
+- **Every overwrite is logged** (the user, 2026-11-24):
+  - `apply_accounts` writes `account_change_log` `overwritten` (Xero's code, name and type before and
+    after; `changed_by` NULL) when a rename or recode reaches an account.
+  - It writes `linked` when a Minty account Xero takes over by code and type.
+  - The Minty code stays.
+  - Names are cut to 80 (a longer Xero name failed the whole sync).
+  - Types Petty Cash's chart excludes (BANK, EQUITY, OTHERINCOME, SALES, REVENUE) and an empty Xero
+    code are still not refreshed.
 - **A contact archived in Xero (C4)**: `POST /api/internal/xero/contacts/<id>/relink {xero_contact_id,
   reason}` (assertion scope `xero-contact-relink`; `merge.relink_contact`) - Petty Cash's and Payment
   Requests' publish follow Xero's merge (`merged_in_xero`, no prompt) and their "map it now" (`user`). The
@@ -578,17 +613,7 @@ The doc "Minty Xero Sync & Report Decisions" (claude.ai artifact HV37p5LpnzconZB
   company deleted holding it: 409.
 - **One account mapped again (A3)**: `GET /api/me/company/xero/matching/account?account=<id>` (the row and
   the Xero accounts of its kind) and `POST {account_id, xero_account_id}` (`XERO_SETTINGS_UPDATE`;
-  `matching.read_one` / `map_one`, through `_link`: Xero's code, name and type; no records move, nothing
-  in the merging table). Another active account holding that Xero account: 409 `{error, merge_into}` -
-  merge instead (the user's rule). `matching.GONE_FROM_XERO` is the doc's sentence.
-- Tests: `hub/tests/test_company_merge.py`, `hub/tests/test_xero_matching.py` (A3).
-
-**Disconnect while a matching is open (the user, 2026-11-19).** `POST /api/me/company/xero/disconnect`
-(`disconnect.disconnect_entity_from_xero`) closes an open matching and drops its unsaved picks
-(`account_match_draft`). A company that never finished its FIRST matching (`setup_mode` still `minty`)
-was never connected, so its organisation goes too: it keeps its books in Minty, as before it signed in
-to Xero. A connected company (changing its matches, or a new organisation or accounts) keeps its
-organisation, as every disconnect does. The suppliers step (`matching.contacts_pending`: accounts
-matched, a supplier not in Xero, not `connected`) counts only while `connected_by_user_id` is set - a
-Disconnect clears it, so a disconnected company with Minty-only suppliers (C1) reads disconnected, not
-"Matching isn't finished" (production, 2026-11-23). Tests: `hub/tests/test_xero_matching.py`.
+  `matching.read_one` / `map_one`, through `_link`: Xero's code, name and type, the Minty code kept; no
+  records move, nothing in the merging table). Another active account holding that Xero account: 409
+  `{error}` - choose a different one (`matching.TAKEN`). `matching.GONE_FROM_XERO` is the doc's sentence.
+- Tests: `hub/tests/test_company_merge.py`, `hub/tests/test_xero_matching.py` (A3), `xero/tests/test_sync.py`.

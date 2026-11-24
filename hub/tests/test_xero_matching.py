@@ -1,13 +1,14 @@
 """Matching a Minty company's accounts to Xero on connect (Settings Phase 2, 2026-11-11;
 ``xero/services/matching.py``, ``hub/xero_matching.py``).
 
-The owner's rules (Minty ``docs/modernisation/xero_optional_database.md`` §4): same code AND type is
-picked automatically; any other pair is the person's; Finish is refused while an account a record uses
-(an expense or bill line, any daily-closing account, a sales method) has no pick; an unused unmatched
-account is archived, never deleted; accounts picked to one Xero account are combined; each picked
-account takes Xero's identity in place, so every reference stays; suppliers are linked by name else
-created in Xero; the company stays disconnected until they are all through. Xero faked at
-``requests``; Postgres only (the sync's lock and the schema's triggers).
+The owner's rules (Minty ``docs/modernisation/xero_optional_database.md`` §4) with the user's of
+2026-11-24: same code AND type is picked automatically; any other pair is the person's; EVERY account
+needs its own Xero account before Finish - used or not, nothing is archived and accounts are never
+merged, so two can't share one; each picked account takes Xero's link, code and name in place (its
+Minty code stays), so every reference stays; the contacts step comes before Finish - each supplier
+takes a Xero contact (the same name is picked for it) or stays new in Xero (C1: its first publish puts
+it there), each daily-closing contact still empty takes a Xero contact. Xero faked at ``requests``;
+Postgres only (the sync's lock and the schema's triggers).
 """
 
 from __future__ import annotations
@@ -65,8 +66,14 @@ class FakeXero:
             {"AccountID": "x-clean", "Code": "420", "Name": "Cleaning", "Type": "OVERHEADS", "Status": "ACTIVE"},
             {"AccountID": "x-dir", "Code": "880", "Name": "Owner A Funds Introduced", "Type": "CURRLIAB",
              "Status": "ACTIVE"},
+            {"AccountID": "x-casual", "Code": "478", "Name": "Casual Wages", "Type": "EXPENSE", "Status": "ACTIVE"},
+            {"AccountID": "x-lic", "Code": "485", "Name": "Subscriptions", "Type": "EXPENSE", "Status": "ACTIVE"},
+            {"AccountID": "x-print", "Code": "461", "Name": "Printing & Stationery", "Type": "EXPENSE",
+             "Status": "ACTIVE"},
         ]
-        self.contacts = [{"ContactID": "c-abc", "Name": "ABC Supplies", "ContactStatus": "ACTIVE"}]
+        self.contacts = [{"ContactID": "c-abc", "Name": "ABC Supplies", "ContactStatus": "ACTIVE"},
+                         {"ContactID": "c-walkin", "Name": "Walk-in Customer", "ContactStatus": "ACTIVE"},
+                         {"ContactID": "c-ada", "Name": "Ada Director", "ContactStatus": "ACTIVE"}]
 
     def get(self, url, headers=None, params=None, timeout=None, **_):
         if url.endswith("/Accounts"):
@@ -142,6 +149,23 @@ def _rows(body):
     return {r["name"]: r for g in body["groups"] for r in g["rows"]}
 
 
+def _contact_copy(guid, org=ORG):
+    from minty_db.models import XeroContact
+
+    return XeroContact.objects.get(xero_guid=guid, xero_org_id=org)
+
+
+def _answer(m, body):
+    return call("patch", BASE + "/contacts", m["admin"], m["entity"].id, body)
+
+
+def _answer_slots(m):
+    """Daily closing's three contacts, each a Xero contact (one person may be two of them)."""
+    for slot, guid in (("cash_sale", "c-walkin"), ("director", "c-ada"), ("discrepancy", "c-ada")):
+        resp = _answer(m, {"slot": slot, "xero_contact_id": str(_contact_copy(guid).id)})
+        assert resp.status_code == 200, (slot, resp.content)
+
+
 # ---- begin and the page ------------------------------------------------------------------------------
 
 
@@ -152,16 +176,34 @@ def test_a_connect_picks_same_code_and_type_only_and_reads_the_page(minty):
 
     body = call("get", BASE, minty["admin"], minty["entity"].id).json()
     rows = _rows(body)
-    assert (body["matched"], body["total"]) == (1, 9)
+    assert (body["matched"], body["total"], body["blocking"]) == (1, 9, 8), "every account needs a match"
     assert rows["Rent"]["pick"]["auto"] is True
     assert rows["Cleaning Expense"]["conflict"] == {"code": "420", "name": "Cleaning"}
     assert rows["Bank Account"]["suggestion"] == str(_copy("x-bank").id), "a bank by its number"
     assert rows["Online Sales"]["used"] is True, "daily closing's cash sale account"
     assert rows["Salaries - Part Time"]["used"] is True, "daily closing's discrepancy account"
     assert rows["Licences"]["used"] is False
-    assert body["will_archive"] == ["Cleaning Expense", "Licences", "Salaries - Full Time"]
-    assert [g["title"] for g in body["groups"]] == ["Cash & bank", "Sales", "Running the business",
-                                                     "Owed to the director"]
+    assert "will_archive" not in body and "will_combine" not in body
+    # the accounts still to match come first (in the groups' order, then by code), then the matched ones
+    # in their groups
+    assert [g["key"] for g in body["groups"]] == ["unmatched", "running"]
+    assert [(r["name"], r["group"]) for r in body["groups"][0]["rows"]] == [
+        ("Petty Cash", "Cash & bank"), ("Bank Account", "Cash & bank"), ("Online Sales", "Sales"),
+        ("Cleaning Expense", "Running the business"), ("Salaries - Full Time", "Running the business"),
+        ("Salaries - Part Time", "Running the business"), ("Licences", "Running the business"),
+        ("Amount Due to Director", "Owed to the director")]
+    held = {o["name"]: o["held_by"] for o in body["options"]}
+    assert held["Rent"] == "Rent" and held["Cleaning"] is None
+
+
+def test_a_xero_account_another_account_has_is_refused(minty):
+    """Accounts are never merged (the user, 2026-11-24): one Minty account per Xero account."""
+    assert _pick(minty, "wages_ft", "x-wages").status_code == 200
+    resp = _pick(minty, "wages_pt", "x-wages")
+    assert resp.status_code == 409
+    assert resp.json()["error"] == matching.TAKEN_PICK.format(other="Salaries - Full Time")
+    assert not AccountMatchDraft.objects.filter(account_id=minty["wages_pt"].id).exists()
+    assert _pick(minty, "wages_ft", "x-wages").status_code == 200, "its own pick again is no clash"
 
 
 def test_a_cashier_can_read_but_not_pick(minty):
@@ -189,70 +231,59 @@ def test_a_pick_must_fit(minty):
 # ---- finish -----------------------------------------------------------------------------------------
 
 
-def test_finish_is_refused_while_a_used_account_has_no_match(minty):
+def _match_accounts(m, skip=()):
+    for row, guid in (("petty", "x-pc"), ("bank", "x-bank"), ("wages_ft", "x-wages"), ("wages_pt", "x-casual"),
+                      ("sales", "x-sales"), ("director", "x-dir"), ("clean", "x-clean"), ("unused", "x-lic")):
+        if row not in skip:
+            assert _pick(m, row, guid).status_code == 200, row
+
+
+def _match_everything(m):
+    _match_accounts(m)
+    _answer_slots(m)
+
+
+def test_finish_is_refused_while_any_account_has_no_match_used_or_not(minty):
+    _match_accounts(minty, skip=("unused",))
+    _answer_slots(minty)
     resp = call("post", BASE + "/finish", minty["admin"], minty["entity"].id)
-    assert resp.status_code == 409 and "still need a Xero match" in resp.json()["error"]
+    assert resp.status_code == 409
+    assert resp.json()["error"] == matching.UNMATCHED.format(n=1)
     assert Entity.objects.get(id=minty["entity"].id).setup_mode == "minty"
     assert not AccountChangeLog.objects.filter(entity_id=minty["entity"].id).exists()
 
 
-def _match_everything_used(m):
-    for row, guid in (("petty", "x-pc"), ("bank", "x-bank"), ("wages_ft", "x-wages"), ("wages_pt", "x-wages"),
-                      ("sales", "x-sales"), ("director", "x-dir")):
-        assert _pick(m, row, guid).status_code == 200, row
-
-
-def test_finish_links_in_place_combines_archives_and_logs(minty, xero):
-    _match_everything_used(minty)
+def test_finish_links_each_account_in_place_keeps_its_minty_code_and_logs(minty, xero):
+    _match_everything(minty)
     resp = call("post", BASE + "/finish", minty["admin"], minty["entity"].id)
     assert resp.status_code == 200, resp.content
     body = resp.json()
-    assert (body["connected"], body["failed_contacts"]) == (True, [])
+    assert (body["connected"], body["failed_contacts"], body["pettycash_contacts_missing"]) == (True, [], [])
 
     entity = Entity.objects.get(id=minty["entity"].id)
     assert (entity.setup_mode, entity.status) == ("xero", "connected")
     assert entity.xero_publish_from == datetime.now(ZoneInfo("Asia/Hong_Kong")).date()
 
     petty = AccountInfo.objects.get(id=minty["petty"].id)
-    assert (petty.xero_account_id, petty.xero_code, petty.name) == ("x-pc", "090", "Petty Cash")
+    assert (petty.xero_account_id, petty.xero_code, petty.code, petty.name) == ("x-pc", "090", "1000", "Petty Cash")
     settings = EntityPettycashSettings.objects.get(entity_id=entity.id)
     assert settings.pettycash_account_id == petty.id, "the same row: daily closing still points at it"
 
     sales = AccountInfo.objects.get(id=minty["sales"].id)
-    assert (sales.xero_account_id, sales.xero_code) == ("x-sales", "200")
+    assert (sales.xero_account_id, sales.xero_code, sales.code) == ("x-sales", "200", "4001")
     assert settings.cash_sale_account_id == sales.id
     assert AccountModule.objects.get(account_id=sales.id, module_code="PETTY_CASH").is_active
 
-    full, part = AccountInfo.objects.get(id=minty["wages_ft"].id), AccountInfo.objects.get(id=minty["wages_pt"].id)
-    survivor, merged = (full, part) if full.merged_into_id is None else (part, full)
-    assert survivor.xero_account_id == "x-wages" and merged.merged_into_id == survivor.id
-    assert merged.record_status == "archived"
-    assert settings.discrepancy_account_id == survivor.id, "re-pointed to the survivor"
+    for row, guid in (("wages_ft", "x-wages"), ("wages_pt", "x-casual"), ("unused", "x-lic"), ("clean", "x-clean")):
+        account = AccountInfo.objects.get(id=minty[row].id)
+        assert (account.xero_account_id, account.record_status, account.merged_into_id) == (guid, "active", None), row
     bill_code = EntityBillAccountXero.objects.get(entity_id=entity.id, xero_account_id="x-wages")
-    assert bill_code.account_code == "477", "the bill code follows the new code"
+    assert bill_code.account_code == "477", "the bill code follows the Xero code"
 
-    for row in ("unused", "clean"):
-        archived = AccountInfo.objects.get(id=minty[row].id)
-        assert (archived.record_status, archived.xero_account_id) == ("archived", None), row
-
-    kinds = sorted(AccountChangeLog.objects.filter(entity_id=entity.id).values_list("kind", flat=True))
-    assert kinds.count("merged") == 1 and kinds.count("archived") == 2
+    kinds = set(AccountChangeLog.objects.filter(entity_id=entity.id).values_list("kind", flat=True))
+    assert kinds <= {"linked", "overwritten"}, "nothing merged, nothing archived"
+    assert AccountChangeLog.objects.filter(entity_id=entity.id).count() == 9
     assert not AccountMatchDraft.objects.filter(entity_id=entity.id).exists()
-
-
-def test_finish_combines_accounts_that_each_have_a_bill_code(minty, xero):
-    """Both accounts picked to one Xero account had a bill code (production, 2026-11-13: 6010 Other
-    Expense and 6900 Cash Over / Short to one Xero account): one bill code takes the Xero account, the
-    other goes - two would break the one-row-per-Xero-account key and Finish failed every time."""
-    entity = minty["entity"]
-    EntityBillAccountXero.objects.create(entity_id=entity.id, account_code="6002", account_name="Salaries - Part Time",
-                                         account_type="EXPENSE", xero_account_id="", is_active=True)
-    _match_everything_used(minty)
-
-    resp = call("post", BASE + "/finish", minty["admin"], entity.id)
-    assert resp.status_code == 200, resp.content
-    codes = EntityBillAccountXero.objects.filter(entity_id=entity.id)
-    assert list(codes.values_list("account_code", "xero_account_id")) == [("477", "x-wages")]
 
 
 def test_finish_relabels_every_bill_line_published_ones_too(minty, xero):
@@ -268,58 +299,134 @@ def test_finish_relabels_every_bill_line_published_ones_too(minty, xero):
                                     published_account_name="Salaries - Full Time")
     draft = Bill.objects.create(entity_id=entity.id, reference="B-2", xero_account_code="6002")
     by_code = BillLine.objects.create(bill=draft, account_code="6002", account_name="Salaries - Part Time")
-    _match_everything_used(minty)
+    _match_everything(minty)
 
     resp = call("post", BASE + "/finish", minty["admin"], entity.id)
 
     assert resp.status_code == 200, resp.content
-    survivor = AccountInfo.objects.get(xero_account_id="x-wages", entity_id=entity.id)
-    for line in (on_id, by_code):
+    for line, row, code, label in ((on_id, "wages_ft", "477", "Wages and Salaries"),
+                                   (by_code, "wages_pt", "478", "Casual Wages")):
         line.refresh_from_db()
-        assert (line.account_id, line.account_code, line.account_name) == (
-            survivor.id, "477", "Wages and Salaries")
+        assert (line.account_id, line.account_code, line.account_name) == (minty[row].id, code, label)
     assert (on_id.published_account_code, on_id.published_account_name) == ("6001", "Salaries - Full Time")
-    assert set(Bill.objects.filter(entity_id=entity.id).values_list("xero_account_code", flat=True)) == {"477"}
+    published.refresh_from_db()
+    draft.refresh_from_db()
+    assert (published.xero_account_code, draft.xero_account_code) == ("477", "478")
 
 
 # ---- suppliers ---------------------------------------------------------------------------------------
 
 
-def test_suppliers_are_linked_by_name_and_the_rest_stay_in_minty_and_it_connects(minty, xero):
-    """Connecting creates nothing in Xero (owner's decisions doc C2, 2026-11-19): a supplier with a
-    Xero contact of its name (case and extra spaces ignored) is linked; the others stay in Minty and
-    go to Xero at their first publish. Finish connects the company straight away."""
+def test_the_contacts_step_picks_the_same_name_and_asks_for_the_rest(minty, xero):
+    """The contacts step (the user, 2026-11-24): each supplier with a Xero contact of its name (case,
+    spaces and punctuation ignored) has it picked; the others are asked - a Xero contact, or new in
+    Xero (C1: its first publish puts it there; connecting creates nothing in Xero, C2)."""
     entity = minty["entity"]
     abc = XeroContactSync.objects.create(entity_id=entity.id, name="  abc   supplies ", source="user")
     new = XeroContactSync.objects.create(entity_id=entity.id, name="Wing Lee Trading Co.", source="user")
-    _match_everything_used(minty)
+    call("post", BASE + "/refresh", minty["admin"], entity.id)  # contacts made after the connect
+    _match_everything(minty)
 
+    contacts = call("get", BASE, minty["admin"], entity.id).json()["contacts"]
+    suppliers = {r["name"]: r for r in contacts["suppliers"]}
+    assert suppliers["  abc   supplies "]["pick"] == {"xero_contact_id": str(_contact_copy("c-abc").id),
+                                                       "auto": True, "new": False}
+    assert suppliers["Wing Lee Trading Co."]["pick"] is None
+    assert contacts["blocking"] == 1 and contacts["required"] is True
+
+    resp = call("post", BASE + "/finish", minty["admin"], entity.id)
+    assert resp.status_code == 409 and resp.json()["error"] == matching.CONTACTS_UNMATCHED.format(n=1)
+    assert Entity.objects.get(id=entity.id).setup_mode == "minty", "nothing written"
+
+    assert _answer(minty, {"contact_id": str(new.id), "new": True}).status_code == 200
     body = call("post", BASE + "/finish", minty["admin"], entity.id).json()
     assert (body["connected"], body["failed_contacts"]) == (True, [])
-    assert XeroContactSync.objects.get(id=abc.id).xero_contact_id == "c-abc", "case and spaces ignored"
-    assert XeroContactSync.objects.get(id=new.id).xero_contact_id is None, "stays in Minty"
+    assert XeroContactSync.objects.get(id=abc.id).xero_contact_id == "c-abc"
+    assert XeroContactSync.objects.get(id=new.id).xero_contact_id is None, "new in Xero at its first publish"
     kinds = list(ContactChangeLog.objects.filter(entity_id=entity.id).values_list("kind", flat=True))
     assert kinds == ["linked"]
     assert Entity.objects.get(id=entity.id).status == "connected"
 
 
-def test_a_supplier_typed_another_way_is_linked_to_xeros_contact_of_its_name(minty, xero):
-    """The user, 2026-11-23: case, spaces and punctuation don't count ("abc-supplies")."""
+def test_a_supplier_can_take_any_xero_contact_and_two_on_one_are_merged(minty, xero):
+    """Contacts keep merging (the user, 2026-11-24: only accounts don't): a supplier picked to a Xero
+    contact another Minty contact already holds moves to that one."""
     entity = minty["entity"]
-    abc = XeroContactSync.objects.create(entity_id=entity.id, name="abc-supplies", source="user")
-    _match_everything_used(minty)
+    held = XeroContactSync.objects.create(entity_id=entity.id, name="ABC (old)", xero_contact_id="c-abc",
+                                          xero_org_id=ORG)
+    other = XeroContactSync.objects.create(entity_id=entity.id, name="Supplies of ABC", source="user")
+    call("post", BASE + "/refresh", minty["admin"], entity.id)
+    _match_everything(minty)
+    assert _answer(minty, {"contact_id": str(other.id), "xero_contact_id": str(_contact_copy("c-abc").id)}
+                   ).status_code == 200
 
-    body = call("post", BASE + "/finish", minty["admin"], entity.id).json()
-    assert (body["connected"], body["failed_contacts"]) == (True, [])
-    assert XeroContactSync.objects.get(id=abc.id).xero_contact_id == "c-abc"
+    resp = call("post", BASE + "/finish", minty["admin"], entity.id)
+    assert resp.status_code == 200, resp.content
+    other.refresh_from_db()
+    assert (other.merged_into_id, other.record_status) == (held.id, "archived")
+
+
+def test_the_daily_closing_contacts_are_asked_before_finish_and_set(minty, xero):
+    """Production, 2026-11-23: a Minty company's daily closing had no contacts (Minty's rules need
+    none); Xero's need three, and Publish then refused. They are the contacts step's now."""
+    entity = minty["entity"]
+    _match_accounts(minty)
+    contacts = call("get", BASE, minty["admin"], entity.id).json()["contacts"]
+    assert [r["slot"] for r in contacts["slots"]] == ["cash_sale", "director", "discrepancy"]
+    resp = call("post", BASE + "/finish", minty["admin"], entity.id)
+    assert resp.status_code == 409 and resp.json()["error"] == matching.CONTACTS_UNMATCHED.format(n=3)
+
+    _answer_slots(minty)
+    resp = call("post", BASE + "/finish", minty["admin"], entity.id)
+    assert resp.status_code == 200, resp.content
+    settings = EntityPettycashSettings.objects.get(entity_id=entity.id)
+    walkin = XeroContactSync.objects.get(entity_id=entity.id, xero_contact_id="c-walkin")
+    ada = XeroContactSync.objects.get(entity_id=entity.id, xero_contact_id="c-ada")
+    assert (settings.cash_sale_contact_id, settings.director_contact_id, settings.discrepancy_contact_id) == (
+        walkin.id, ada.id, ada.id)
+    assert walkin.xero_org_id == ORG and walkin.name == "Walk-in Customer"
+    assert resp.json()["pettycash_contacts_missing"] == []
+
+
+def test_the_contacts_step_leaves_out_what_daily_closing_doesnt_need(minty, xero):
+    entity = minty["entity"]
+    Entity.objects.filter(id=entity.id).update(uses_sales_cash=False)
+    slots = call("get", BASE, minty["admin"], entity.id).json()["contacts"]["slots"]
+    assert [r["slot"] for r in slots] == ["director", "discrepancy"], "every sale banked: no cash-sale contact"
+
+    person = XeroContactSync.objects.create(entity_id=entity.id, name="Ada", xero_contact_id="c-ada", xero_org_id=ORG)
+    EntityPettycashSettings.objects.filter(entity_id=entity.id).update(director_contact_id=person.id,
+                                                                       discrepancy_contact_id=person.id)
+    assert call("get", BASE, minty["admin"], entity.id).json()["contacts"]["slots"] == []
+
+    EntityPettycashSettings.objects.filter(entity_id=entity.id).delete()
+    assert call("get", BASE, minty["admin"], entity.id).json()["contacts"]["slots"] == [], "no daily closing"
+
+
+def test_a_contacts_answer_must_be_one_this_step_asks(minty, xero):
+    entity, xero_id = minty["entity"], str(_contact_copy("c-ada").id)
+    resp = _answer(minty, {"slot": "director", "new": True})
+    assert (resp.status_code, resp.json()["error"]) == (400, matching.SLOT_NEEDS_XERO)
+    assert _answer(minty, {"slot": "tips", "xero_contact_id": xero_id}).status_code == 404
+    import uuid as _uuid
+
+    assert _answer(minty, {"contact_id": str(_uuid.uuid4()), "xero_contact_id": xero_id}).status_code == 404
+    assert _answer(minty, {"slot": "director", "xero_contact_id": str(_uuid.uuid4())}).status_code == 400
+    assert _answer({**minty, "admin": minty["cashier"]}, {"slot": "director", "xero_contact_id": xero_id}
+                   ).status_code == 403
+    assert _answer(minty, {"slot": "director", "xero_contact_id": xero_id}).status_code == 200
+    assert _answer(minty, {"slot": "director", "xero_contact_id": None}).status_code == 200, "cleared"
+    assert call("get", BASE, minty["admin"], entity.id).json()["contacts"]["slots"][1]["pick"] is None
 
 
 def test_a_company_the_old_rule_left_disconnected_is_connected_by_try_again(minty, xero):
     """Before 2026-11-19 Finish kept a company disconnected until every supplier was in Xero. Try
-    again (the contacts route) now links by name and connects it, creating nothing."""
+    again (the contacts route) links by name and connects it, creating nothing."""
     entity = minty["entity"]
     stuck = XeroContactSync.objects.create(entity_id=entity.id, name="Star Ferry Logistics", source="user")
-    _match_everything_used(minty)
+    call("post", BASE + "/refresh", minty["admin"], entity.id)
+    _match_everything(minty)
+    assert _answer(minty, {"contact_id": str(stuck.id), "new": True}).status_code == 200
     call("post", BASE + "/finish", minty["admin"], entity.id)
     Entity.objects.filter(id=entity.id).update(status="disconnected")  # as the old rule left it
 
@@ -376,15 +483,6 @@ def test_petty_cash_and_the_bank_cant_become_one_xero_account(minty):
     assert (resp.status_code, resp.json()["error"]) == (400, matching.SAME_BANK)
     assert not AccountMatchDraft.objects.filter(account_id=minty["bank"].id).exists()
 
-    # a draft that got there anyway (an older page) is refused at Finish, nothing written
-    AccountMatchDraft.objects.create(account_id=minty["bank"].id, entity_id=minty["entity"].id,
-                                     xero_account_id=_copy("x-pc").id, picked_by=None)
-    for row, guid in (("wages_ft", "x-wages"), ("wages_pt", "x-wages"), ("sales", "x-sales"), ("director", "x-dir")):
-        _pick(minty, row, guid)
-    resp = call("post", BASE + "/finish", minty["admin"], minty["entity"].id)
-    assert (resp.status_code, resp.json()["error"]) == (409, matching.SAME_BANK)
-    assert Entity.objects.get(id=minty["entity"].id).setup_mode == "minty"
-
 
 def test_a_sync_while_matching_only_refreshes_the_copies(minty, xero):
     """Petty Cash Settings asks for a sync: it must not import Xero's chart as accounts beside the
@@ -401,19 +499,19 @@ def test_finish_folds_an_unused_xero_row_that_holds_a_picked_account(minty):
     account is removed, not a reason to refuse."""
     AccountInfo.objects.create(entity_id=minty["entity"].id, name="Petty Cash", type="BANK", xero_code="090",
                                xero_account_id="x-pc", status="ACTIVE", source="xero")
-    _match_everything_used(minty)
+    _match_everything(minty)
     resp = call("post", BASE + "/finish", minty["admin"], minty["entity"].id)
     assert resp.status_code == 200, resp.content
     rows = AccountInfo.objects.filter(entity_id=minty["entity"].id, xero_account_id="x-pc")
     assert list(rows.values_list("id", flat=True)) == [minty["petty"].id], "the company's own row carries it"
 
 
-def test_a_disconnect_after_matching_keeps_the_xero_codes(minty, xero):
-    """Owner, 2026-11-12: disconnected, the company's accounts keep their Xero (matched) codes and
-    names - nothing reverts to the Minty codes; only removing an account takes it away."""
+def test_a_disconnect_after_matching_keeps_both_codes(minty, xero):
+    """Owner, 2026-11-12: disconnected, the company's accounts keep their Xero codes and names; the
+    user, 2026-11-24: each keeps its Minty code beside its Xero code all along."""
     from xero.services.disconnect import disconnect_entity_from_xero
 
-    _match_everything_used(minty)
+    _match_everything(minty)
     assert call("post", BASE + "/finish", minty["admin"], minty["entity"].id).status_code == 200
     rent_before = AccountInfo.objects.get(id=minty["rent"].id)
 
@@ -421,12 +519,12 @@ def test_a_disconnect_after_matching_keeps_the_xero_codes(minty, xero):
 
     entity = Entity.objects.get(id=minty["entity"].id)
     assert (entity.status, entity.setup_mode, entity.xero_org_id) == ("disconnected", "xero", ORG)
-    for row, code, name in (("petty", "090", "Petty Cash"), ("sales", "200", "Sales"), ("rent", "469", "Rent")):
+    for row, minty_code, xero_code, name in (("petty", "1000", "090", "Petty Cash"), ("sales", "4001", "200", "Sales"),
+                                             ("rent", "469", "469", "Rent")):
         account = AccountInfo.objects.get(id=minty[row].id)
-        assert (account.xero_code, account.code, account.name, account.record_status) == (code, code, name,
-                                                                                          "active"), row
+        assert (account.code, account.xero_code, account.name, account.record_status) == (
+            minty_code, xero_code, name, "active"), row
     assert AccountInfo.objects.get(id=minty["rent"].id).xero_account_id == rent_before.xero_account_id
-    assert not AccountInfo.objects.filter(entity_id=entity.id, code="1000").exists(), "no Minty code comes back"
 
 # ---- Phase 3 (owner, 2026-11-12): a new organisation is matched from scratch, older records stay with
 # the old one (xero_publish_from reset); changing the matches reuses the page, prefilled, and affects
@@ -440,44 +538,10 @@ def _copy_in(guid, org=ORG):
     return XeroAccount.objects.get(xero_guid=guid, xero_org_id=org)
 
 
-def test_finish_names_the_petty_cash_contacts_still_to_choose(minty, xero):
-    """Production, 2026-11-23: a Minty company's daily closing had no contacts (Minty's rules need
-    none); Finish moves it to Xero's, which need three, and Publish then refused. Finish says which."""
-    _match_everything_used(minty)
-    body = call("post", BASE + "/finish", minty["admin"], minty["entity"].id).json()
-    assert body["connected"] is True
-    assert body["pettycash_contacts_missing"] == ["cash_sale", "director", "discrepancy"]
-
-
-def test_finish_leaves_out_the_cash_sale_contact_when_every_sale_is_banked(minty, xero):
-    Entity.objects.filter(id=minty["entity"].id).update(uses_sales_cash=False)
-    _match_everything_used(minty)
-    body = call("post", BASE + "/finish", minty["admin"], minty["entity"].id).json()
-    assert body["pettycash_contacts_missing"] == ["director", "discrepancy"]
-
-
-def test_finish_names_no_contact_once_all_three_are_chosen(minty, xero):
-    entity = minty["entity"]
-    person = XeroContactSync.objects.create(entity_id=entity.id, name="Ada Director", source="user")
-    customer = XeroContactSync.objects.create(entity_id=entity.id, name="Walk-in Customer", source="user")
-    EntityPettycashSettings.objects.filter(entity_id=entity.id).update(
-        cash_sale_contact_id=customer.id, director_contact_id=person.id, discrepancy_contact_id=person.id)
-    _match_everything_used(minty)
-    body = call("post", BASE + "/finish", minty["admin"], entity.id).json()
-    assert body["pettycash_contacts_missing"] == []
-
-
-def test_finish_names_no_contact_for_a_company_without_daily_closing_set(minty, xero):
-    EntityPettycashSettings.objects.filter(entity_id=minty["entity"].id).delete()
-    _match_everything_used(minty)
-    body = call("post", BASE + "/finish", minty["admin"], minty["entity"].id).json()
-    assert body["pettycash_contacts_missing"] == []
-
-
 @pytest.fixture
 def connected(minty, xero):
     """Phase 2 done: matched, connected, publishing from an earlier day."""
-    _match_everything_used(minty)
+    _match_everything(minty)
     assert call("post", BASE + "/finish", minty["admin"], minty["entity"].id).status_code == 200
     Entity.objects.filter(id=minty["entity"].id).update(xero_publish_from=date(2026, 1, 1))
     minty["entity"].refresh_from_db()
@@ -497,7 +561,8 @@ def test_changing_starts_prefilled_and_cancel_leaves_everything(connected):
     resp = call("post", BASE + "/change", admin, entity.id)
     assert resp.status_code == 200, resp.content
     body = resp.json()
-    assert body["reason"] == "change" and body["matched"] == body["total"]
+    assert body["reason"] == "change" and body["matched"] == body["total"] == 9
+    assert body["contacts"]["required"] is False, "a change is about the accounts"
     assert _rows(body)["Rent"]["pick"]["xero_account_id"] == str(_copy_in("x-rent").id)
     assert Entity.objects.get(id=entity.id).status == "connected", "publishing goes on"
 
@@ -520,6 +585,8 @@ def test_a_change_can_swap_two_accounts_and_keeps_the_publish_date(connected):
     wages = AccountInfo.objects.get(entity_id=entity.id, xero_account_id="x-wages")
     connected["wages"] = wages
     assert call("post", BASE + "/change", admin, entity.id).status_code == 200
+    assert _pick_in(connected, "rent", "x-wages").status_code == 409, "Wages still has it: one each"
+    assert _pick_in(connected, "wages", None).status_code == 200
     assert _pick_in(connected, "rent", "x-wages").status_code == 200
     assert _pick_in(connected, "wages", "x-rent").status_code == 200
 
@@ -577,10 +644,9 @@ def test_a_new_organisation_is_matched_from_scratch_and_older_records_stay_behin
     assert body["reason"] == "new_org"
     assert _rows(body)["Rent"]["pick"]["xero_account_id"] == str(_copy_in("y-rent", ORG2).id), "same code and type"
 
-    for row, guid in (("petty", "y-pc"), ("bank", "y-bank"), ("sales", "y-sales"), ("director", "y-dir")):
-        assert _pick_in(connected, row, guid, ORG2).status_code == 200, row
-    connected["survivor"] = AccountInfo.objects.get(entity_id=entity.id, xero_account_id="x-wages")
-    assert _pick_in(connected, "survivor", "y-wages", ORG2).status_code == 200
+    assert body["blocking"] == 0, "every account's Xero code and type is in the new organisation"
+    assert body["contacts"]["blocking"] == 0, "each contact of the old organisation by its name"
+    assert _pick_in(connected, "petty", "y-pc", ORG2).status_code == 200
     resp = call("post", BASE + "/finish", admin, entity.id)
     assert resp.status_code == 200, resp.content
 
@@ -635,29 +701,29 @@ def test_an_account_gone_from_xero_is_mapped_again_and_nothing_moves(connected):
     assert page.status_code == 200, page.content
     body = page.json()
     assert body["gone_from_xero"] is True and body["message"] == matching.GONE_FROM_XERO
-    assert body["row"]["name"] == "Rent" and any(o["name"] == "Cleaning" for o in body["options"])
+    assert body["row"]["name"] == "Rent" and any(o["name"] == "Printing & Stationery" for o in body["options"])
 
     resp = call("post", BASE + "/account", admin, entity.id,
-                {"account_id": str(rent.id), "xero_account_id": str(_copy_in("x-clean").id)})
+                {"account_id": str(rent.id), "xero_account_id": str(_copy_in("x-print").id)})
     assert resp.status_code == 200, resp.content
     rent.refresh_from_db()
-    assert (rent.xero_account_id, rent.status, rent.record_status, rent.xero_code) == (
-        "x-clean", "ACTIVE", "active", "420")
+    assert (rent.xero_account_id, rent.status, rent.record_status, rent.xero_code, rent.code) == (
+        "x-print", "ACTIVE", "active", "461", "469"), "Xero's code beside the Minty code"
     assert ReportExpense.objects.filter(account_id=rent.id).count() == 1, "no records move (A3)"
     assert not MintyMerge.objects.filter(merged_id=rent.id).exists(), "nothing in the merging table"
     assert not MintyMerge.objects.filter(kept_id=rent.id).exists()
 
 
-def test_mapping_to_a_xero_account_another_account_holds_says_merge_instead(connected):
+def test_mapping_to_a_xero_account_another_account_holds_is_refused(connected):
+    """Accounts are never merged (the user, 2026-11-24): pick another Xero account."""
     entity, admin = connected["entity"], connected["admin"]
     rent = _gone(connected, "rent")
     holder = AccountInfo.objects.get(entity_id=entity.id, xero_account_id="x-wages", record_status="active")
     resp = call("post", BASE + "/account", admin, entity.id,
                 {"account_id": str(rent.id), "xero_account_id": str(_copy_in("x-wages").id)})
     assert resp.status_code == 409
-    assert resp.json() == {"error": f"{holder.name} is already linked to that Xero account. Merge Rent into "
-                                    f"{holder.name} instead.",
-                           "merge_into": {"id": str(holder.id), "name": holder.name}}
+    assert resp.json() == {"error": f"{holder.name} is already linked to that Xero account. Choose a different "
+                                    "Xero account."}
     rent.refresh_from_db()
     assert rent.xero_account_id == "x-rent", "nothing changed"
 
@@ -665,7 +731,7 @@ def test_mapping_to_a_xero_account_another_account_holds_says_merge_instead(conn
 def test_mapping_needs_the_right_and_one_of_the_companys_xero_accounts(connected):
     entity = connected["entity"]
     rent = _gone(connected, "rent")
-    body = {"account_id": str(rent.id), "xero_account_id": str(_copy_in("x-clean").id)}
+    body = {"account_id": str(rent.id), "xero_account_id": str(_copy_in("x-print").id)}
     assert call("post", BASE + "/account", connected["cashier"], entity.id, body).status_code == 403
     import uuid as _uuid
 
@@ -718,3 +784,36 @@ def test_disconnecting_while_changing_the_matches_keeps_the_organisation(connect
     entity.refresh_from_db()
     assert (entity.xero_matching, str(entity.xero_org_id), entity.status) == (None, ORG, "disconnected")
     assert not AccountMatchDraft.objects.filter(entity_id=entity.id).exists()
+
+
+# ---- a reconnect that matches again: every account shown, the matched ones prefilled (the user, 2026-11-24)
+
+
+def test_a_reconnect_with_a_new_minty_account_shows_every_account_matched_ones_prefilled(connected, xero):
+    entity, admin = connected["entity"], connected["admin"]
+    extra = own(entity, "6300", "Staff Meals", "EXPENSE", "expense")
+    Entity.objects.filter(id=entity.id).update(status="disconnected")
+    entity.refresh_from_db()
+    reason = matching.needs_matching(entity, ORG)
+    assert reason == "new_accounts"
+    xero.accounts.append({"AccountID": "x-meals", "Code": "425", "Name": "Staff Meals", "Type": "EXPENSE",
+                          "Status": "ACTIVE"})
+    with transaction.atomic():
+        matching.begin(entity.id, "tok", ORG, reason=reason)
+
+    body = call("get", BASE, admin, entity.id).json()
+    assert body["total"] == 10 and body["matched"] == 9 and body["blocking"] == 1
+    assert body["groups"][0]["key"] == "unmatched"
+    assert [r["name"] for r in body["groups"][0]["rows"]] == ["Staff Meals"]
+    assert _rows(body)["Rent"]["pick"]["xero_account_id"] == str(_copy("x-rent").id), "prefilled"
+    assert body["contacts"]["blocking"] == 0
+
+    connected["extra"] = extra
+    assert _pick(connected, "extra", "x-meals").status_code == 200
+    resp = call("post", BASE + "/finish", admin, entity.id)
+    assert resp.status_code == 200, resp.content
+    extra.refresh_from_db()
+    assert (extra.xero_account_id, extra.code, extra.xero_code) == ("x-meals", "6300", "425")
+    latest = AccountChangeLog.objects.filter(entity_id=entity.id).order_by("-changed_at").first()
+    assert list(AccountChangeLog.objects.filter(batch_id=latest.batch_id).values_list("account_id", flat=True)) == [
+        extra.id], "the prefilled matches write nothing"

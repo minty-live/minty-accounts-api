@@ -1078,7 +1078,9 @@ def test_a_reconnect_to_another_organisation_matches_instead_of_mirroring(shop, 
     assert xero.syncs == [], "no sync until Finish"
 
 
-def test_a_reconnect_to_the_same_organisation_matches_only_accounts_added_meanwhile(shop, xero):
+def test_a_reconnect_to_the_same_organisation_matches_accounts_added_meanwhile_the_linked_prefilled(shop, xero):
+    """The user, 2026-11-24: a reconnect that matches shows every account - the ones linked to the
+    organisation already picked (prefilled), the one added meanwhile picked by its code and type."""
     from minty_db.models import AccountMatchDraft
 
     entity = shop["entity"]
@@ -1097,8 +1099,8 @@ def test_a_reconnect_to_the_same_organisation_matches_only_accounts_added_meanwh
     company = fresh(entity)
     assert (company.status, company.xero_matching) == ("disconnected", "new_accounts")
     assert AccountInfo.objects.get(id=linked.id).xero_account_id == "new-400", "untouched"
-    assert list(AccountMatchDraft.objects.filter(entity_id=entity.id).values_list("account_id", flat=True)) == [
-        added.id], "only the account added meanwhile: 420 = 420"
+    assert set(AccountMatchDraft.objects.filter(entity_id=entity.id).values_list("account_id", flat=True)) == {
+        linked.id, added.id}, "the linked one prefilled; the one added meanwhile: 420 = 420"
 
 
 def test_a_plain_reconnect_to_the_same_organisation_opens_no_matching(shop, xero):

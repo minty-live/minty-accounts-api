@@ -529,3 +529,53 @@ def test_a_xero_account_of_a_minty_accounts_code_and_type_links_to_it(company, x
     own.refresh_from_db()
     assert own.xero_account_id == "a-469"
     assert AccountInfo.objects.filter(entity_id=company.id, xero_code="469").count() == 2  # the sales one is new
+
+
+# ---- Minty Code + Xero Code, and every overwrite logged (the user, 2026-11-24) -------------------------
+
+
+def test_a_rename_or_recode_in_xero_is_logged_and_minty_keeps_its_own_code(company, xero):
+    """Xero's code and name overwrite the account's Xero code and name, logged in account_change_log
+    (``overwritten``, by the sync); its Minty code (``code``) stays as it was."""
+    from minty_db.models import AccountChangeLog
+
+    xero.accounts = [acct("a-1", "429", "General")]
+    _run(company)
+    AccountInfo.objects.filter(entity_id=company.id, xero_account_id="a-1").update(code="6100")
+    xero.accounts = [acct("a-1", "431", "General Costs")]
+
+    _run(company)
+
+    row = _accounts(company)["a-1"]
+    assert (row.code, row.xero_code, row.name) == ("6100", "431", "General Costs")
+    log = AccountChangeLog.objects.get(account_id=row.id)
+    assert (log.kind, log.before_code, log.before_name, log.after_code, log.after_name) == (
+        "overwritten", "429", "General", "431", "General Costs")
+    assert (log.changed_by, log.xero_org_id, log.xero_guid) == (None, TENANT, "a-1")
+
+    _run(company)
+    assert AccountChangeLog.objects.filter(account_id=row.id).count() == 1, "nothing changed, nothing logged"
+
+
+def test_a_long_name_from_xero_is_cut_to_what_minty_holds(company, xero):
+    xero.accounts = [acct("a-1", "429", "General")]
+    _run(company)
+    xero.accounts = [acct("a-1", "429", "Office " * 20)]
+
+    _run(company)
+
+    assert _accounts(company)["a-1"].name == ("Office " * 20)[:80]
+
+
+def test_a_minty_account_xero_takes_over_by_code_and_type_is_logged_linked(company, xero):
+    from minty_db.models import AccountChangeLog
+
+    own = AccountInfo.objects.create(entity_id=company.id, name="Rent", code="6200", xero_code="469",
+                                     account_type="expense", type="EXPENSE", status="ACTIVE", source="user")
+    xero.accounts = [acct("a-469", "469", "Rent HK")]
+
+    _run(company)
+
+    own.refresh_from_db()
+    assert (own.xero_account_id, own.code, own.xero_code) == ("a-469", "6200", "469")
+    assert list(AccountChangeLog.objects.filter(account_id=own.id).values_list("kind", flat=True)) == ["linked"]

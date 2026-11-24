@@ -73,8 +73,6 @@ urlpatterns = [
     path("api/me/company/accounts/<str:account_id>", company_chart.company_account, name="company_account"),
     path("api/me/company/contacts", company_chart.company_contacts, name="company_contacts"),
     path("api/me/company/contacts/<str:contact_id>", company_chart.company_contact, name="company_contact"),
-    path("api/me/company/accounts/<str:account_id>/merge", company_chart.company_account_merge,
-         name="company_account_merge"),
     path("api/me/company/contacts/<str:contact_id>/merge", company_chart.company_contact_merge,
          name="company_contact_merge"),
     path("api/me/company/xero/disconnect", company.company_xero_disconnect, name="company_xero_disconnect"),

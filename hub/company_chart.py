@@ -11,9 +11,10 @@ Its answer and status come back as they are; onboarding-api checks the person's 
 Viewing is ``COA_VIEW`` (cashier and up); adding, changing and deleting accounts and contacts are
 ``COA_CREATE`` / ``COA_UPDATE`` / ``COA_DELETE`` (accountant and up).
 
-``POST .../accounts|contacts/<id>/merge {"into": <id>}`` merges two of them here, not in
-onboarding-api: the merge is accounts-api's one implementation (``xero/services/merge.py``, the
-owner's decisions doc M1-M4), shared with Xero matching. ``COA_DELETE`` - a merge takes one away.
+``POST .../contacts/<id>/merge {"into": <id>}`` merges two contacts here, not in onboarding-api:
+the merge is accounts-api's one implementation (``xero/services/merge.py``, the owner's decisions doc
+M1-M4), shared with Xero matching. ``COA_DELETE`` - a merge takes one away. Accounts are never merged
+(the user, 2026-11-24).
 
 Opening the contact list reads the company's contacts from Xero first - read only, at most once
 every 2 minutes (owner's decisions doc C2, 2026-11-19), as Petty Cash Settings does.
@@ -129,7 +130,7 @@ def company_contact(request: HttpRequest, contact_id: str) -> HttpResponse:
     return _door(request, ("PATCH", "DELETE"), f"contacts/{contact_id}")
 
 
-MERGE_DENIED = "You don't have permission to merge this company's accounts and contacts."
+MERGE_DENIED = "You don't have permission to merge this company's contacts."
 PICK_ONE = "Choose which one to keep, then merge."
 
 
@@ -148,10 +149,6 @@ def _merge(request: HttpRequest, record_id: str, merge) -> HttpResponse:
         return respond(request, merge(entity_id, merged_id, kept_id, user.id))
     except merging.Refused as refusal:
         return refuse(request, refusal.message, refusal.status)
-
-
-def company_account_merge(request: HttpRequest, account_id: str) -> HttpResponse:
-    return _merge(request, account_id, merging.merge_accounts)
 
 
 def company_contact_merge(request: HttpRequest, contact_id: str) -> HttpResponse:

@@ -1,18 +1,19 @@
-"""Merging two of a company's accounts, or two of its contacts (the owner's decisions doc "Minty Xero
-Sync & Report Decisions", M1-M4, 2026-11-19).
+"""Merging two of a company's contacts (the owner's decisions doc "Minty Xero Sync & Report
+Decisions", M1-M4, 2026-11-19). Accounts are never merged (the user, 2026-11-24): an account matches
+its own Xero account, and Settings has no account Merge; accounts merged before then keep their
+``merged_into_id`` and merging-table rows, and every reader still follows them.
 
-A merge moves every record on the merged one to the one kept - expenses, bill lines, bills, daily
-closing's slots, the module ticks - and archives the merged one with ``merged_into_id``, so it can't
-be picked for new records and the AI readers never suggest it. No new record is made and Xero is not
-touched (M1). ``minty_merge`` keeps the merge (from, to, who, when, why) and ``minty_merge_record``
-every record that moved, so each one's original can always be found (M2); there is no undo in the
-app (M4).
+A merge moves every record on the merged contact to the one kept - expenses, bills, daily closing's
+slots - and archives the merged one with ``merged_into_id``, so it can't be picked for new records
+and the AI readers never suggest it. No new record is made and Xero is not touched (M1).
+``minty_merge`` keeps the merge (from, to, who, when, why) and ``minty_merge_record`` every record
+that moved, so each one's original can always be found (M2); there is no undo in the app (M4).
 
-The ONE merge behaviour (M3): the combine at Xero matching's Finish (``matching._combine``,
-``matching._merge_supplier``) runs these, with reason ``xero_matching``; the Settings Merge
-(``hub/company_chart.py``) runs ``merge_accounts`` / ``merge_contacts``, reason ``user``; a contact
-Xero merged into one the company already has (C4) runs ``merge_contacts``, reason
-``merged_in_xero``. Callers hold the transaction and ``sync.lock``; the two public merges take both.
+The ONE merge behaviour (M3): Xero matching's Finish (``matching._merge_supplier``) runs it with
+reason ``xero_matching``; the Settings Merge (``hub/company_chart.py``) runs ``merge_contacts``,
+reason ``user``; a contact Xero merged into one the company already has (C4) runs
+``merge_contacts``, reason ``merged_in_xero``. Callers hold the transaction and ``sync.lock``; the
+public merges take both.
 """
 
 from __future__ import annotations
@@ -21,15 +22,9 @@ import logging
 import uuid
 
 from django.db import transaction
-from django.db.models import Q
 from minty_db.models import (
-    AccountInfo,
-    AccountModule,
     Bill,
-    BillLine,
     ContactChangeLog,
-    EntityAccountXero,
-    EntityBillAccountXero,
     EntityPettycashSettings,
     MintyMerge,
     MintyMergeRecord,
@@ -44,8 +39,6 @@ logger = logging.getLogger("minty-accounts-api")
 NOT_FOUND = "That isn't one of this company's {kind}s any more. Reload the list and try again."
 SAME = "Choose two different {kind}s to merge."
 MERGED_AWAY = "{name} was already merged into another {kind}. Choose another one to keep."
-OTHER_CLASS = "{name} and {other} are different kinds of account, so they can't be merged."
-SYSTEM = "Daily closing needs {name}, so it can't be merged away. Keep it, and merge the other into it."
 
 
 class Refused(Exception):
@@ -82,73 +75,6 @@ class _Merge:
             self.moved[table] = self.moved.get(table, 0) + len(ids)
 
 
-def _code(account: AccountInfo) -> str:
-    return (account.xero_code or account.code or "").strip()
-
-
-def combine_accounts(entity_id, kept: AccountInfo, others: list[AccountInfo], batch, user_id, *, reason: str,
-                     user_merge: bool = False) -> dict[str, int]:
-    """Every record of ``others`` moved to ``kept``; each archived with ``merged_into_id`` and logged
-    (``account_change_log`` + the merging table). Every bill line moved, published ones included,
-    takes the kept account's code and name (``bill_text``; a republish sends them, nothing is re-sent).
-    ``user_merge``: the Settings Merge - the merged account's bill code also goes off Payment Settings;
-    Xero matching's Finish does that itself (``matching._link``)."""
-    from xero.services.matching import _log, _minty_type
-
-    moved: dict[str, int] = {}
-    for other in others:
-        merge = _Merge(entity_id, "account", other.id, kept.id, reason, user_id)
-        merge.move(ReportExpense.objects.filter(account_id=other.id), "report_expense", "account_id",
-                   account_id=kept.id)
-        merge.move(BillLine.objects.filter(account_id=other.id), "bill_line", "account_id", account_id=kept.id)
-        for column in usage.ACCOUNT_SLOTS:
-            merge.move(EntityPettycashSettings.objects.filter(entity_id=entity_id, **{column: other.id}),
-                       "entity_pettycash_settings", column, **{column: kept.id})
-        for module in AccountModule.objects.filter(account_id=other.id):
-            mine = AccountModule.objects.filter(account_id=kept.id, module_code=module.module_code).first()
-            if mine is None:
-                AccountModule.objects.create(account_id=kept.id, module_code=module.module_code, entity_id=entity_id,
-                                             is_active=module.is_active, is_default=False)
-            elif module.is_active and not mine.is_active:
-                AccountModule.objects.filter(account_id=kept.id, module_code=module.module_code).update(is_active=True)
-            # account_module has no id of its own (its key is the account and the module): the row
-            # is recorded by the merged account, its module in the column
-            merge.record("account_module", f"account_id:{module.module_code}"[:63], [other.id])
-        AccountModule.objects.filter(account_id=other.id).delete()
-        ticks = EntityAccountXero.objects.filter(account_id=other.id)
-        if EntityAccountXero.objects.filter(account_id=kept.id).exists():
-            merge.record("entity_account_xero", "account_id", ticks.values_list("id", flat=True))
-            ticks.delete()
-        else:
-            first = ticks.first()
-            if first is not None:
-                merge.move(EntityAccountXero.objects.filter(id=first.id), "entity_account_xero", "account_id",
-                           account_id=kept.id)
-                merge.record("entity_account_xero", "account_id", ticks.exclude(id=first.id)
-                             .values_list("id", flat=True))
-                ticks.exclude(id=first.id).delete()
-        if user_merge:
-            # M1: off every picker - Payment Settings and the invoice reader read entity_bill_account_xero
-            codes = Q(account_code=_code(other)) & (Q(xero_account_id__isnull=True) | Q(xero_account_id=""))
-            if other.xero_account_id:
-                codes |= Q(xero_account_id=other.xero_account_id)
-            merge.move(EntityBillAccountXero.objects.filter(entity_id=entity_id).filter(codes),
-                       "entity_bill_account_xero", "account_code", is_active=False, is_deleted=True)
-        before = (_code(other), other.name, _minty_type(other))
-        AccountInfo.objects.filter(id=other.id).update(record_status="archived", status="ARCHIVED",
-                                                       merged_into_id=kept.id)
-        other.record_status, other.status = "archived", "ARCHIVED"
-        _log(batch, entity_id, other, "merged", before, user_id, merged_into=kept)
-        for table, count in merge.moved.items():
-            moved[table] = moved.get(table, 0) + count
-        logger.info("merge: company %s account %s merged into %s (%s): %s", entity_id, other.id, kept.id, reason,
-                    merge.moved)
-    # every bill line now on the kept account, published ones included, shows its code and name
-    # (the user's rule, 2026-11-24; no Xero call)
-    bill_text.refresh_accounts(entity_id, [kept.id])
-    return moved
-
-
 def combine_contacts(entity_id, kept: XeroContactSync, merged: XeroContactSync, batch, user_id, *,
                      reason: str) -> dict[str, int]:
     """Every record of ``merged`` moved to ``kept``; ``merged`` archived with ``merged_into_id`` and
@@ -178,38 +104,6 @@ def combine_contacts(entity_id, kept: XeroContactSync, merged: XeroContactSync, 
 def _active(model, entity_id, record_id):
     return model.objects.filter(entity_id=entity_id, id=record_id, record_status="active",
                                 merged_into__isnull=True).first()
-
-
-def _gone_from_xero(entity_id, record_id):
-    """A linked account Xero archived or removed: archived here only because Xero's status says so
-    (the sync sets ``status``, a trigger ``record_status``), never merged away. It may be merged into
-    an account Xero has - A3's "merge instead" (2026-11-20) - but is never the one kept."""
-    return (AccountInfo.objects.filter(entity_id=entity_id, id=record_id, record_status="archived",
-                                       merged_into__isnull=True, xero_account_id__isnull=False)
-            .exclude(status="ACTIVE").first())
-
-
-def merge_accounts(entity_id, merged_id, kept_id, user_id) -> dict:
-    """``merged_id``'s records moved to ``kept_id`` (M1-M4). Raises ``Refused``."""
-    if str(merged_id) == str(kept_id):
-        raise Refused(SAME.format(kind="account"), 400)
-    with transaction.atomic():
-        sync.lock(entity_id)
-        merged = AccountInfo.objects.filter(entity_id=entity_id, id=merged_id).first()
-        kept = AccountInfo.objects.filter(entity_id=entity_id, id=kept_id).first()
-        if merged is None or kept is None:
-            raise Refused(NOT_FOUND.format(kind="account"), 404)
-        if kept.merged_into_id is not None:
-            raise Refused(MERGED_AWAY.format(name=kept.name, kind="account"))
-        mergeable = _active(AccountInfo, entity_id, merged.id) or _gone_from_xero(entity_id, merged.id)
-        if mergeable is None or _active(AccountInfo, entity_id, kept.id) is None:
-            raise Refused(NOT_FOUND.format(kind="account"), 404)
-        if merged.is_system:
-            raise Refused(SYSTEM.format(name=merged.name))
-        if merged.account_class != kept.account_class:
-            raise Refused(OTHER_CLASS.format(name=merged.name, other=kept.name))
-        moved = combine_accounts(entity_id, kept, [merged], uuid.uuid4(), user_id, reason="user", user_merge=True)
-    return {"moved": moved, "message": f"{merged.name} merged into {kept.name}."}
 
 
 def merge_contacts(entity_id, merged_id, kept_id, user_id, *, reason: str = "user") -> dict:

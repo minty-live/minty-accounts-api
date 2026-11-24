@@ -11,9 +11,13 @@ Each is the hub's door plus ``?entity=`` and a permission, as the Integration ta
   (``hub/transport.py`` ``METHODS``) allows no PUT, so a browser never sent one.
 - ``POST /api/me/company/xero/matching/refresh``: Xero's accounts read again; ``{"throttle": true}``
   (the page opening) skips Xero when they were read under 2 minutes ago.
-- ``POST /api/me/company/xero/matching/finish``: the replace, then the suppliers; answers
-  ``{connected, failed_contacts}`` with the page.
-- ``POST /api/me/company/xero/matching/contacts``: the suppliers Xero refused, sent again.
+- ``PATCH /api/me/company/xero/matching/contacts`` ``{contact_id | slot, xero_contact_id | null, new}``:
+  one answer of the contacts step (the user, 2026-11-24) - a supplier's Xero contact or new in Xero,
+  a daily-closing contact's Xero contact; saved at once.
+- ``POST /api/me/company/xero/matching/finish``: the replace with the contacts step's answers, then
+  connected; answers ``{connected, failed_contacts, pettycash_contacts_missing}`` with the page.
+- ``POST /api/me/company/xero/matching/contacts``: Try again for a company the old rules left
+  disconnected (suppliers linked by name).
 - ``POST /api/me/company/xero/matching/change``: change the matches (Phase 3, 2026-11-12) - a connected
   company's page again, prefilled; ``POST .../cancel`` leaves a change, nothing changed.
 """
@@ -46,7 +50,8 @@ def _token(entity_id):
 
 
 def _finish_suppliers(request: HttpRequest, user, entity_id) -> HttpResponse:
-    """The suppliers step, then - when every one is in Xero - connected, and the first sync."""
+    """Try again's suppliers (the old rules), then - when every one is in Xero - connected, and the
+    first sync."""
     from hub.xero_oauth import start_background_sync
 
     access_token, org = _token(entity_id)
@@ -110,22 +115,44 @@ def company_xero_matching_finish(request: HttpRequest) -> HttpResponse:
         matching.finish(entity_id, user.id)
     except matching.Refused as refusal:
         return refuse(request, refusal.message, refusal.status)
-    if changing:
-        # A change of the matches is about the accounts (Phase 3): its suppliers are left as they are,
-        # and the company stays connected - nothing is created in Xero.
-        entity = Entity.objects.get(id=entity_id)
-        return respond(request, {**matching.read(entity), "connected": True, "failed_contacts": [],
-                                 "pettycash_contacts_missing": matching.pettycash_contacts_missing(entity_id)})
-    try:
-        return _finish_suppliers(request, user, entity_id)
-    except matching.Refused as refusal:
-        # The accounts are matched (committed); the suppliers wait for Try again.
-        entity = Entity.objects.get(id=entity_id)
-        return respond(request, {**matching.read(entity), "connected": False, "failed_contacts": [],
-                                 "error": refusal.message})
+    if not changing:
+        # The contacts step's answers went in with the accounts (the user, 2026-11-24): connected now.
+        # A change of the matches is about the accounts, and the company stayed connected.
+        from hub.xero_oauth import start_background_sync
+
+        matching.complete(entity_id)
+        try:
+            access_token, org = _token(entity_id)
+        except matching.Refused:
+            logger.warning("xero matching: company %s finished with no Xero token; the first sync waits", entity_id)
+        else:
+            start_background_sync(entity_id, access_token, org, "Xero matching")
+    entity = Entity.objects.get(id=entity_id)
+    return respond(request, {**matching.read(entity), "connected": True, "failed_contacts": [],
+                             "pettycash_contacts_missing": matching.pettycash_contacts_missing(entity_id)})
 
 
 def company_xero_matching_contacts(request: HttpRequest) -> HttpResponse:
+    if request.method == "PATCH":
+        early, user, entity_id = _open(request, Permission.XERO_SETTINGS_UPDATE, NO_EDIT)
+        if early is not None:
+            return early
+        data = _body(request)
+        contact_id, slot = data.get("contact_id"), data.get("slot")
+        xero_contact_id, new = data.get("xero_contact_id"), data.get("new", False)
+        if (contact_id is None) == (slot is None) or not isinstance(new, bool) or (
+                slot is not None and not isinstance(slot, str)):
+            return refuse(request, matching.CONTACT_NOT_OWN, 400)
+        if contact_id is not None and _uuid(contact_id) is None:
+            return refuse(request, matching.CONTACT_NOT_OWN, 400)
+        if xero_contact_id is not None and _uuid(xero_contact_id) is None:
+            return refuse(request, matching.NOT_A_CONTACT, 400)
+        try:
+            return respond(request, matching.pick_contact(
+                entity_id, user.id, contact_id=contact_id and _uuid(contact_id), slot=slot,
+                xero_contact_id=xero_contact_id and _uuid(xero_contact_id), new=new))
+        except matching.Refused as refusal:
+            return refuse(request, refusal.message, refusal.status)
     if request.method not in ("POST", "OPTIONS"):
         return refuse(request, "Method not allowed", 405)
     early, user, entity_id = _open(request, Permission.XERO_SETTINGS_UPDATE, NO_EDIT)
@@ -163,7 +190,7 @@ def company_xero_matching_account(request: HttpRequest) -> HttpResponse:
     """One account mapped again (the owner's decisions doc A3, 2026-11-19): ``GET ?account=<id>`` -
     the account as a matching row and the Xero accounts to pick from; ``POST {account_id,
     xero_account_id}`` - linked to it (``matching.map_one``). A Xero account another active account
-    holds: 409 with ``merge_into`` (the user's rule: merge instead)."""
+    holds: 409 (accounts are never merged - the user, 2026-11-24)."""
     if request.method == "POST":
         early, user, entity_id = _open(request, Permission.XERO_SETTINGS_UPDATE, NO_EDIT)
         if early is not None:
@@ -174,9 +201,6 @@ def company_xero_matching_account(request: HttpRequest) -> HttpResponse:
             return refuse(request, matching.NOT_A_XERO_ACCOUNT, 400)
         try:
             return respond(request, matching.map_one(Entity.objects.get(id=entity_id), account_id, copy_id, user.id))
-        except matching.Taken as taken:
-            return respond(request, {"error": taken.message,
-                                     "merge_into": {"id": str(taken.holder.id), "name": taken.holder.name}}, 409)
         except matching.Refused as refusal:
             return refuse(request, refusal.message, refusal.status)
     if request.method not in ("GET", "OPTIONS"):

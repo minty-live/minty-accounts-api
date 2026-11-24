@@ -1,7 +1,8 @@
-"""Merging two accounts or two contacts in Settings (``POST /api/me/company/{accounts|contacts}/<id>/merge``,
+"""Merging two contacts in Settings (``POST /api/me/company/contacts/<id>/merge``,
 ``xero/services/merge.py``; the owner's decisions doc M1-M4, 2026-11-19): every record moves to the
 one kept, the merged one is archived with ``merged_into_id``, the merging table keeps what moved, and
-Xero is not touched. Postgres only (the sync lock)."""
+Xero is not touched. Accounts are never merged (the user, 2026-11-24): their merge is gone. Postgres
+only (the sync lock)."""
 
 from __future__ import annotations
 
@@ -11,11 +12,7 @@ import uuid
 import pytest
 from minty_db.models import (
     AccountInfo,
-    AccountModule,
     Bill,
-    BillLine,
-    EntityAccountXero,
-    EntityBillAccountXero,
     EntityPettycashSettings,
     MintyMerge,
     MintyMergeRecord,
@@ -44,100 +41,6 @@ def expenses(entity, account_row, n, contact=None):
                                          contact_id=contact.id if contact else None) for _ in range(n)]
 
 
-def test_merging_taxi_into_transport_moves_every_record_and_keeps_what_moved(shop):
-    """M1/M2: the doc's example - Taxi (12 expenses) into Transport (35): Transport has 47."""
-    entity = shop["entity"]
-    taxi, transport = account(entity, "Taxi", "471"), account(entity, "Transport", "470")
-    expenses(entity, taxi, 12)
-    expenses(entity, transport, 35)
-    bill = Bill.objects.create(entity_id=entity.id, reference="B-1")
-    line = BillLine.objects.create(bill=bill, account_id=taxi.id, account_code="471")
-    EntityPettycashSettings.objects.create(entity_id=entity.id, discrepancy_account_id=taxi.id)
-    AccountModule.objects.create(account_id=taxi.id, entity_id=entity.id, module_code="PETTY_CASH", is_active=True)
-    EntityAccountXero.objects.create(account_id=taxi.id, is_active=True)
-    code = EntityBillAccountXero.objects.create(entity_id=entity.id, account_code="471", account_name="Taxi",
-                                                account_type="EXPENSE", xero_account_id="", is_active=True)
-
-    resp = call("post", f"{ACCOUNTS}/{taxi.id}/merge", shop["accountant"], entity.id, {"into": str(transport.id)})
-
-    assert resp.status_code == 200, resp.content
-    assert resp.json()["message"] == "Taxi merged into Transport."
-    assert ReportExpense.objects.filter(account_id=transport.id).count() == 47
-    line.refresh_from_db()
-    assert (line.account_id, line.account_code) == (transport.id, "470"), "a republish sends Transport's code"
-    assert EntityPettycashSettings.objects.get(entity_id=entity.id).discrepancy_account_id == transport.id
-    assert AccountModule.objects.filter(account_id=transport.id, module_code="PETTY_CASH").exists()
-    code.refresh_from_db()
-    assert (code.is_active, code.is_deleted) == (False, True), "off Payment Settings and the invoice reader"
-    taxi.refresh_from_db()
-    assert (taxi.record_status, taxi.merged_into_id) == ("archived", transport.id)
-    assert AccountInfo.objects.filter(entity_id=entity.id).count() == 2, "no new account"
-
-    merge = MintyMerge.objects.get(entity_id=entity.id)
-    assert (merge.kind, merge.merged_id, merge.kept_id, merge.reason, merge.merged_by_user_id) == (
-        "account", taxi.id, transport.id, "user", shop["accountant"].id)
-    moved = MintyMergeRecord.objects.filter(merge_id=merge.id)
-    assert moved.filter(table_name="report_expense").count() == 12
-    assert moved.filter(table_name="bill_line", record_id=line.id).exists()
-
-
-def test_a_merge_needs_the_right_two_accounts(shop):
-    entity = shop["entity"]
-    taxi, transport = account(entity, "Taxi", "471"), account(entity, "Transport", "470")
-    bank = account(entity, "HSBC", "090", account_type="bank")
-    petty = account(entity, "Petty Cash", "091", account_type="bank", is_system=True)
-
-    def merge(merged, into, person="accountant"):
-        return call("post", f"{ACCOUNTS}/{merged.id}/merge", shop[person], entity.id, {"into": str(into.id)})
-
-    assert merge(taxi, transport, person="manager").status_code == 403
-    assert merge(taxi, taxi).status_code == 400
-    refused = merge(taxi, bank)
-    assert (refused.status_code, refused.json()["error"]) == (
-        409, "Taxi and HSBC are different kinds of account, so they can't be merged.")
-    assert merge(petty, bank).status_code == 409, "daily closing's own accounts stay"
-    assert merge(taxi, transport).status_code == 200
-    again = merge(transport, taxi)
-    assert again.status_code == 409 and "already merged" in again.json()["error"], "M4: never a merged-away target"
-    assert MintyMerge.objects.filter(entity_id=entity.id).count() == 1
-
-
-def test_an_account_xero_archived_can_be_merged_away_but_never_kept(shop):
-    """A3's "merge instead" (2026-11-20): a used account whose Xero account was archived is archived
-    here too (the sync sets its status, a trigger its record status) - it can still be merged into
-    an account Xero has, and its records move; it can't be the one kept."""
-    entity = shop["entity"]
-    gone = account(entity, "Taxi", "471", xero_account_id="x-taxi")
-    transport = account(entity, "Transport", "470", xero_account_id="x-transport")
-    expenses(entity, gone, 3)
-    AccountInfo.objects.filter(id=gone.id).update(status="ARCHIVED")
-    gone.refresh_from_db()
-    assert gone.record_status == "archived", "the trigger follows Xero's status"
-
-    kept_gone = call("post", f"{ACCOUNTS}/{transport.id}/merge", shop["accountant"], entity.id,
-                     {"into": str(gone.id)})
-    assert kept_gone.status_code == 404, "an account Xero archived is never the one kept"
-
-    resp = call("post", f"{ACCOUNTS}/{gone.id}/merge", shop["accountant"], entity.id, {"into": str(transport.id)})
-
-    assert resp.status_code == 200, resp.content
-    assert ReportExpense.objects.filter(account_id=transport.id).count() == 3
-    gone.refresh_from_db()
-    assert (gone.record_status, gone.merged_into_id) == ("archived", transport.id)
-    again = call("post", f"{ACCOUNTS}/{gone.id}/merge", shop["accountant"], entity.id, {"into": str(transport.id)})
-    assert again.status_code == 404, "merged away once: gone for good"
-
-
-def test_an_account_archived_in_minty_is_still_not_mergeable(shop):
-    entity = shop["entity"]
-    old, transport = account(entity, "Old", "472"), account(entity, "Transport", "470")
-    AccountInfo.objects.filter(id=old.id).update(record_status="archived")
-
-    resp = call("post", f"{ACCOUNTS}/{old.id}/merge", shop["accountant"], entity.id, {"into": str(transport.id)})
-
-    assert resp.status_code == 404
-
-
 def test_merging_contacts_moves_expenses_bills_and_daily_closings(shop):
     entity = shop["entity"]
     kee = XeroContactSync.objects.create(entity_id=entity.id, name="Kee Wah", source="user")
@@ -163,13 +66,24 @@ def test_merging_contacts_moves_expenses_bills_and_daily_closings(shop):
 
 def test_a_stranger_or_another_companys_record_gets_nowhere(shop):
     entity, other = shop["entity"], shop["other"]
-    mine = account(entity, "Taxi", "471")
-    theirs = account(other, "Transport", "470")
-    resp = call("post", f"{ACCOUNTS}/{mine.id}/merge", shop["accountant"], entity.id, {"into": str(theirs.id)})
+    mine = XeroContactSync.objects.create(entity_id=entity.id, name="Kee Wah", source="user")
+    theirs = XeroContactSync.objects.create(entity_id=other.id, name="Kee Wah Bakery", source="user")
+    resp = call("post", f"{CONTACTS}/{mine.id}/merge", shop["accountant"], entity.id, {"into": str(theirs.id)})
     assert resp.status_code == 404
-    assert call("post", f"{ACCOUNTS}/{uuid.uuid4()}/merge", shop["accountant"], entity.id,
+    assert call("post", f"{CONTACTS}/{uuid.uuid4()}/merge", shop["accountant"], entity.id,
                 {"into": str(mine.id)}).status_code == 404
-    assert call("post", f"{ACCOUNTS}/{mine.id}/merge", shop["accountant"], entity.id, {}).status_code == 400
+    assert call("post", f"{CONTACTS}/{mine.id}/merge", shop["accountant"], entity.id, {}).status_code == 400
+    assert not MintyMerge.objects.exists()
+
+
+def test_accounts_are_never_merged(shop):
+    """The user, 2026-11-24: no merging for the chart of accounts - only contacts merge. The route is gone."""
+    entity = shop["entity"]
+    taxi, transport = account(entity, "Taxi", "471"), account(entity, "Transport", "470")
+    resp = call("post", f"{ACCOUNTS}/{taxi.id}/merge", shop["accountant"], entity.id, {"into": str(transport.id)})
+    assert resp.status_code == 404
+    taxi.refresh_from_db()
+    assert (taxi.record_status, taxi.merged_into_id) == ("active", None)
     assert not MintyMerge.objects.exists()
 
 
@@ -238,26 +152,6 @@ def test_the_relink_needs_its_own_assertion_and_good_input(shop):
     assert _relink(entity.id, one.id, {"xero_contact_id": "", "reason": "user"}).status_code == 400
     assert _relink(entity.id, one.id, {"xero_contact_id": "x-2", "reason": "restore"}).status_code == 400
     assert _relink(entity.id, uuid.uuid4(), {"xero_contact_id": "x-2", "reason": "user"}).status_code == 404
-
-
-def test_a_merge_relabels_published_bills_too(shop):
-    """The user's rule (2026-11-24): every bill line on the merged account - published ones included -
-    shows the kept account's code and name, and the bill's header code follows; nothing goes to Xero
-    and what was sent (``published_*``) stays."""
-    entity = shop["entity"]
-    taxi, transport = account(entity, "Taxi", "471"), account(entity, "Transport", "470")
-    bill = Bill.objects.create(entity_id=entity.id, reference="B-1", published="published", xero_account_code="471")
-    line = BillLine.objects.create(bill=bill, account_id=taxi.id, account_code="471", account_name="Taxi",
-                                   published_account_code="471", published_account_name="Taxi")
-
-    resp = call("post", f"{ACCOUNTS}/{taxi.id}/merge", shop["accountant"], entity.id, {"into": str(transport.id)})
-
-    assert resp.status_code == 200, resp.content
-    line.refresh_from_db()
-    assert (line.account_id, line.account_code, line.account_name) == (transport.id, "470", "Transport")
-    assert (line.published_account_code, line.published_account_name) == ("471", "Taxi"), "the record stays"
-    bill.refresh_from_db()
-    assert bill.xero_account_code == "470"
 
 
 def test_a_contact_merge_renames_its_bills_published_too(shop):
