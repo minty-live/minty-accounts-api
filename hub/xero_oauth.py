@@ -147,12 +147,13 @@ def _to_sign_in() -> HttpResponse:
     return HttpResponseRedirect("/")
 
 
-def _login(request: HttpRequest, user: User) -> None:
-    """Flask-Login's ``login_user``: a switched-off account (``is_active`` false) is not signed in."""
+def _login(request: HttpRequest, user: User, *, keep_live: bool = False) -> None:
+    """Flask-Login's ``login_user``: a switched-off account (``is_active`` false) is not signed in.
+    ``keep_live``: a connect or reconnect keeps the person's live sign-in (``sign_in``)."""
     if not user.is_active:
         logger.warning("Xero callback: user %s is switched off; not signed in", user.id)
         return
-    sign_in(request, user)
+    sign_in(request, user, keep_live=keep_live)
 
 
 def _onboarding_xero_return(request: HttpRequest, connected: bool, org_name: str = "", *, mismatch: bool = False,
@@ -671,10 +672,10 @@ def _connect(request: HttpRequest, code, error, from_onboarding: bool, entity_id
             connect.revoke_new_grant(grant.access_token, curr_conn, tenant_id)
             return failed()
         if begins_matching and not from_onboarding:
-            _login(request, user)
+            _login(request, user, keep_live=True)
             return _to_matching(request, entity.id)
         start_background_sync(entity.id, grant.access_token, tenant_id, "Entity Connect")
-        _login(request, user)
+        _login(request, user, keep_live=True)
         flash(request, "Connected to Xero! I'm pulling in your accounts and contacts now.", "success")
         if from_onboarding:
             return _onboarding_xero_return(request, True, entity.xero_tenant_name or "")
@@ -723,7 +724,7 @@ def _reconnect(request: HttpRequest, code, error, entity_id: str, state_initiato
     try:
         connect.store_bundle(user, grant.bundle)
         try:
-            _login(request, user)
+            _login(request, user, keep_live=True)
         except Exception:
             logger.warning("Entity Reconnect: login_user refresh skipped")
     except Exception:

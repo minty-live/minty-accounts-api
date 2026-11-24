@@ -133,6 +133,11 @@ Xero nonce. Flask's `sessions` table is no longer used.
 
 - `sign_in` gives the session a new key (no fixation) derived from a fresh `login_sid`, and stamps
   presence.
+  **Except a Xero connect or reconnect (the user, 2026-11-24; `keep_live`):** when the same person
+  is still signed in, that sign-in is kept (same key and `login_sid`, Terms re-checked), so the
+  tokens other tabs and apps hold stay good. A new sign-in there ended them all and each showed
+  "Your session has expired" (production, 24 Nov). A sign-in by code or with Xero always starts a
+  new one.
 - `signed_in_user`: a cookie naming a person who is gone or not approved is emptied.
 - **No CSRF middleware.** The JSON routes are called cross-origin with a bearer token and no
   cookie. The two cookie POSTs, `/logout` and `/leave-entity` (`hub/handoffs.py`), must come from

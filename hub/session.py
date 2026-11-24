@@ -78,14 +78,16 @@ def sign_in_ended(request: HttpRequest) -> bool:
     return bool(SessionStore().decode(row.session_data).get(USER_KEY))
 
 
-def sign_in(request: HttpRequest, user: User) -> None:
+def sign_in(request: HttpRequest, user: User, *, keep_live: bool = False) -> None:
+    """A new sign-in. ``keep_live`` (a Xero connect or reconnect's callback only - the user,
+    2026-11-24): the same person, still signed in, keeps that sign-in, so the tokens other tabs and
+    apps hold stay good (a new one ended them all, and each showed "Your session has expired"). A
+    sign-in by code or with Xero always starts a new one, which also ends a copied cookie."""
     sid = request.session.get(LOGIN_SID_KEY)
-    if (request.session.get(USER_KEY) == str(user.id) and sid
+    if (keep_live and request.session.get(USER_KEY) == str(user.id) and sid
             and request.session.session_key == session_key_for(sid)):
-        # The same person, still signed in (a Xero connect's callback, a second sign-in tab): the
-        # sign-in is kept, so the tokens other tabs and apps hold stay good (2026-11-24: a new one
-        # ended them all, and each showed "Your session has expired"). The key already came from
-        # a sign-in, so keeping it fixes nothing on anyone. The Terms are still checked afresh.
+        # The key already came from this person's sign-in, so keeping it fixes nothing on anyone.
+        # The Terms are still checked afresh.
         request.session.pop("terms_ok", None)
         request.session["last_activity"] = time.time()
         logger.info("session: already signed in user=%s; sign-in kept", user.id)
