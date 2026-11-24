@@ -28,7 +28,9 @@ def grants(entity_id):
 @pytest.fixture
 def policy(db):
     return AiPolicy.objects.create(id=1, primary_model="gemini-3.8-flash", backup_model=None,
-                                   default_grant={"tokens": 20000}, limit_rules=[])
+                                   default_grant={"tokens": 20000}, limit_rules=[],
+                                   model_prices={"gemini-3.8-flash": {"input": 0.75, "output": 3.75,
+                                                                      "cached_input": 0.075}})
 
 
 def read(entity, grant=None, *, tokens=5000, status="ok", module="petty_cash"):
