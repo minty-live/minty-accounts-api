@@ -37,7 +37,7 @@ from minty_db.models import (
     XeroContactSync,
 )
 
-from xero.services import sync, usage
+from xero.services import bill_text, sync, usage
 
 logger = logging.getLogger("minty-accounts-api")
 
@@ -89,22 +89,18 @@ def _code(account: AccountInfo) -> str:
 def combine_accounts(entity_id, kept: AccountInfo, others: list[AccountInfo], batch, user_id, *, reason: str,
                      user_merge: bool = False) -> dict[str, int]:
     """Every record of ``others`` moved to ``kept``; each archived with ``merged_into_id`` and logged
-    (``account_change_log`` + the merging table). ``user_merge``: the Settings Merge - its bill lines
-    take the kept account's code (a republish sends it) and the merged account's bill code goes off
-    Payment Settings; Xero matching's Finish does both itself (``matching._link``)."""
+    (``account_change_log`` + the merging table). Every bill line moved, published ones included,
+    takes the kept account's code and name (``bill_text``; a republish sends them, nothing is re-sent).
+    ``user_merge``: the Settings Merge - the merged account's bill code also goes off Payment Settings;
+    Xero matching's Finish does that itself (``matching._link``)."""
     from xero.services.matching import _log, _minty_type
 
     moved: dict[str, int] = {}
-    kept_code = _code(kept)
     for other in others:
         merge = _Merge(entity_id, "account", other.id, kept.id, reason, user_id)
         merge.move(ReportExpense.objects.filter(account_id=other.id), "report_expense", "account_id",
                    account_id=kept.id)
-        lines = BillLine.objects.filter(account_id=other.id)
-        if user_merge and kept_code:
-            merge.move(lines, "bill_line", "account_id", account_id=kept.id, account_code=kept_code)
-        else:
-            merge.move(lines, "bill_line", "account_id", account_id=kept.id)
+        merge.move(BillLine.objects.filter(account_id=other.id), "bill_line", "account_id", account_id=kept.id)
         for column in usage.ACCOUNT_SLOTS:
             merge.move(EntityPettycashSettings.objects.filter(entity_id=entity_id, **{column: other.id}),
                        "entity_pettycash_settings", column, **{column: kept.id})
@@ -147,6 +143,9 @@ def combine_accounts(entity_id, kept: AccountInfo, others: list[AccountInfo], ba
             moved[table] = moved.get(table, 0) + count
         logger.info("merge: company %s account %s merged into %s (%s): %s", entity_id, other.id, kept.id, reason,
                     merge.moved)
+    # every bill line now on the kept account, published ones included, shows its code and name
+    # (the user's rule, 2026-11-24; no Xero call)
+    bill_text.refresh_accounts(entity_id, [kept.id])
     return moved
 
 
@@ -169,6 +168,7 @@ def combine_contacts(entity_id, kept: XeroContactSync, merged: XeroContactSync, 
                                     xero_org_id=kept.xero_org_id, xero_guid=kept.xero_contact_id, changed_by=user_id)
     logger.info("merge: company %s contact %s merged into %s (%s): %s", entity_id, merged.id, kept.id, reason,
                 merge.moved)
+    bill_text.refresh_contacts(entity_id, [kept.id])  # its bills, published ones too, show its name
     return merge.moved
 
 

@@ -24,6 +24,8 @@ from minty_db.models import (
     AccountInfo,
     AccountMatchDraft,
     AccountModule,
+    Bill,
+    BillLine,
     ContactChangeLog,
     Entity,
     EntityBillAccountXero,
@@ -251,6 +253,33 @@ def test_finish_combines_accounts_that_each_have_a_bill_code(minty, xero):
     assert resp.status_code == 200, resp.content
     codes = EntityBillAccountXero.objects.filter(entity_id=entity.id)
     assert list(codes.values_list("account_code", "xero_account_id")) == [("477", "x-wages")]
+
+
+def test_finish_relabels_every_bill_line_published_ones_too(minty, xero):
+    """The user's rule (2026-11-24): after Finish every bill line on a matched account - published ones
+    included - shows Xero's code and name, the bill's header code follows, and a line saved before
+    ``bill_line.account_id`` existed (code only) gets the id. Nothing is sent to Xero; what was sent
+    (``published_*``) stays."""
+    entity = minty["entity"]
+    published = Bill.objects.create(entity_id=entity.id, reference="B-1", published="published",
+                                    xero_account_code="6001")
+    on_id = BillLine.objects.create(bill=published, account_id=minty["wages_ft"].id, account_code="6001",
+                                    account_name="Salaries - Full Time", published_account_code="6001",
+                                    published_account_name="Salaries - Full Time")
+    draft = Bill.objects.create(entity_id=entity.id, reference="B-2", xero_account_code="6002")
+    by_code = BillLine.objects.create(bill=draft, account_code="6002", account_name="Salaries - Part Time")
+    _match_everything_used(minty)
+
+    resp = call("post", BASE + "/finish", minty["admin"], entity.id)
+
+    assert resp.status_code == 200, resp.content
+    survivor = AccountInfo.objects.get(xero_account_id="x-wages", entity_id=entity.id)
+    for line in (on_id, by_code):
+        line.refresh_from_db()
+        assert (line.account_id, line.account_code, line.account_name) == (
+            survivor.id, "477", "Wages and Salaries")
+    assert (on_id.published_account_code, on_id.published_account_name) == ("6001", "Salaries - Full Time")
+    assert set(Bill.objects.filter(entity_id=entity.id).values_list("xero_account_code", flat=True)) == {"477"}
 
 
 # ---- suppliers ---------------------------------------------------------------------------------------

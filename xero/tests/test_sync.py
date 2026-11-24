@@ -17,6 +17,8 @@ from django.conf import settings
 from django.test import Client
 from minty_db.models import (
     AccountInfo,
+    Bill,
+    BillLine,
     EntityAccountXero,
     EntityBillAccountXero,
     UserToken,
@@ -141,6 +143,28 @@ def test_renamed_or_recoded_accounts_are_refreshed_but_not_an_excluded_type(comp
     assert (rows["a-bank"].xero_code, rows["a-bank"].name) == ("090", "Bank")  # Flask: BANK isn't refreshed
     assert result["accounts"]["refreshed"] == 1
     assert EntityBillAccountXero.objects.get(entity_id=company.id, xero_account_id="a-1").account_code == "431"
+
+
+def test_a_rename_in_xero_relabels_every_bill_published_ones_too(company, xero):
+    """The user's rule (2026-11-24): a bill line on a renamed or recoded account shows it, published or
+    not; the header code follows; a renamed supplier's bills show its new name; nothing is sent."""
+    xero.accounts = [acct("a-1", "429", "General")]
+    XeroContactSync.objects.create(entity_id=company.id, xero_contact_id="c-1", name="Old Name")
+    _run(company)
+    row = _accounts(company)["a-1"]
+    contact = XeroContactSync.objects.get(entity_id=company.id, xero_contact_id="c-1")
+    bill = Bill.objects.create(entity_id=company.id, reference="B-1", published="published",
+                               xero_account_code="429", contact_id=contact.id, contact_name="Old Name")
+    line = BillLine.objects.create(bill=bill, account_id=row.id, account_code="429", account_name="General")
+    xero.accounts = [acct("a-1", "431", "General Costs")]
+    xero.contact_pages = [[{"ContactID": "c-1", "Name": "New Name"}]]
+
+    _run(company)
+
+    line.refresh_from_db()
+    bill.refresh_from_db()
+    assert (line.account_code, line.account_name, bill.xero_account_code) == ("431", "General Costs", "431")
+    assert bill.contact_name == "New Name"
 
 
 def test_an_inactive_row_is_re_activated_and_the_petty_cash_tick_is_kept(company, xero):

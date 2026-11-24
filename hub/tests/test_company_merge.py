@@ -238,3 +238,37 @@ def test_the_relink_needs_its_own_assertion_and_good_input(shop):
     assert _relink(entity.id, one.id, {"xero_contact_id": "", "reason": "user"}).status_code == 400
     assert _relink(entity.id, one.id, {"xero_contact_id": "x-2", "reason": "restore"}).status_code == 400
     assert _relink(entity.id, uuid.uuid4(), {"xero_contact_id": "x-2", "reason": "user"}).status_code == 404
+
+
+def test_a_merge_relabels_published_bills_too(shop):
+    """The user's rule (2026-11-24): every bill line on the merged account - published ones included -
+    shows the kept account's code and name, and the bill's header code follows; nothing goes to Xero
+    and what was sent (``published_*``) stays."""
+    entity = shop["entity"]
+    taxi, transport = account(entity, "Taxi", "471"), account(entity, "Transport", "470")
+    bill = Bill.objects.create(entity_id=entity.id, reference="B-1", published="published", xero_account_code="471")
+    line = BillLine.objects.create(bill=bill, account_id=taxi.id, account_code="471", account_name="Taxi",
+                                   published_account_code="471", published_account_name="Taxi")
+
+    resp = call("post", f"{ACCOUNTS}/{taxi.id}/merge", shop["accountant"], entity.id, {"into": str(transport.id)})
+
+    assert resp.status_code == 200, resp.content
+    line.refresh_from_db()
+    assert (line.account_id, line.account_code, line.account_name) == (transport.id, "470", "Transport")
+    assert (line.published_account_code, line.published_account_name) == ("471", "Taxi"), "the record stays"
+    bill.refresh_from_db()
+    assert bill.xero_account_code == "470"
+
+
+def test_a_contact_merge_renames_its_bills_published_too(shop):
+    entity = shop["entity"]
+    kee = XeroContactSync.objects.create(entity_id=entity.id, name="Kee Wah", source="user")
+    kee2 = XeroContactSync.objects.create(entity_id=entity.id, name="Kee Wah Bakery", source="user")
+    bill = Bill.objects.create(entity_id=entity.id, reference="B-1", contact_id=kee2.id, contact_name="Kee Wah Bakery",
+                               published="published", published_contact_name="Kee Wah Bakery")
+
+    resp = call("post", f"{CONTACTS}/{kee2.id}/merge", shop["accountant"], entity.id, {"into": str(kee.id)})
+
+    assert resp.status_code == 200, resp.content
+    bill.refresh_from_db()
+    assert (bill.contact_id, bill.contact_name, bill.published_contact_name) == (kee.id, "Kee Wah", "Kee Wah Bakery")

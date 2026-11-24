@@ -54,7 +54,7 @@ from minty_db.models import (
 )
 from minty_shared import names
 
-from xero.services import usage
+from xero.services import bill_text, usage
 
 logger = logging.getLogger("minty-accounts-api")
 
@@ -151,6 +151,7 @@ def apply_accounts(entity_id, accounts: list[dict], org) -> dict:
                and r.record_status == "active"}
         used = usage.used_account_ids(entity_id)
         kept = {}
+        renamed = []
         for row in rows:
             if not row.xero_account_id or row.merged_into_id is not None:
                 # Minty's own account, or one merged away - kept as the record of its merge
@@ -207,6 +208,9 @@ def apply_accounts(entity_id, accounts: list[dict], org) -> dict:
                 row.save(update_fields=sorted(set(changed)))
                 if set(changed) - {"status"}:
                     counts["refreshed"] += 1
+                    renamed.append(row.id)
+        # a rename in Xero shows on every bill (the user's rule, 2026-11-24)
+        bill_text.refresh_accounts(entity_id, renamed)
         _repoint_replaced_settings(entity_id, snapshot)
         _mirror_petty_cash(entity_id, org)
         _mirror_bills(entity_id)
@@ -348,6 +352,7 @@ def apply_contacts(entity_id, contacts: list[dict], org) -> dict:
             entity_id=entity_id, source__in=MINTY_MADE, merged_into__isnull=True, record_status="active")
             .filter(models.Q(xero_contact_id__isnull=True) | models.Q(xero_contact_id=""))}
         own.pop("", None)  # a name with no letters or digits matches nothing
+        renamed = []
         for contact in contacts:
             contact_id = contact.get("ContactID")
             if not contact_id:
@@ -368,6 +373,8 @@ def apply_contacts(entity_id, contacts: list[dict], org) -> dict:
                 row.name = name
                 row.save(update_fields=["name"])
                 counts["renamed"] += 1
+                renamed.append(row.id)
+        bill_text.refresh_contacts(entity_id, renamed)  # the user's rule, 2026-11-24
         if org:
             _copy_contacts(entity_id, contacts, org)
     logger.info("xero sync: contacts for company %s: %s", entity_id, counts)

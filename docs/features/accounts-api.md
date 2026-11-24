@@ -120,7 +120,8 @@ It asks Xero for the ACTIVE accounts **once**. Flask asked three times each time
 - New ones are added.
 - Returning ones are re-activated.
 - Renamed or recoded ones are refreshed. A type Petty Cash's chart excludes (bank, equity, sales,
-  revenue, other income) keeps its old name, as in Flask.
+  revenue, other income) keeps its old name, as in Flask. The bill lines on a refreshed account, published
+  or not, take its new code and name, and their bills the header code (`bill_text`, 2026-11-24).
 - Ones Xero no longer has ACTIVE are deleted only when nothing uses them (`usage.used_account_ids`)
   and Minty didn't make them; otherwise they are ARCHIVED and kept, with what uses them still
   pointing at them (2026-11-11: deleting set them NULL).
@@ -139,7 +140,8 @@ It asks Xero for the ACTIVE accounts **once**. Flask asked three times each time
 - `entity_bill_account_xero` (Payment Requests' codes, adding fixed) likewise, and loses rows whose
   account is gone.
 
-**Contacts** come page by page (1,000 a page). New ones are added and renamed ones updated. Nothing
+**Contacts** come page by page (1,000 a page). New ones are added and renamed ones updated (their
+bills, published or not, take the new name - `bill_text`, 2026-11-24). Nothing
 is removed: absence from Xero's answer is ambiguous. A failed page discards the whole fetch.
 
 **The Xero copies** (Xero optional, minty-db v0.5's EXPAND, 2026-11-10; Minty
@@ -471,7 +473,9 @@ pointing at nothing.
   methods, `account_module`, `entity_account_xero` re-pointed; the others archived with
   `merged_into_id`); each picked account takes Xero's identity IN PLACE (Xero id, code, name, type, link)
   so every reference stays, gets a Petty Cash module row if it had none (X2/X3's tick), and its bill code
-  and unpublished bill lines follow a new code (combined accounts' bill codes become one - the
+  and every bill line on it, published ones included, follow (a line saved with only the old code gets
+  the id; each line takes the account's code and name, its bill the header code - `bill_text`, the
+  user's rule 2026-11-24; nothing goes to Xero) (combined accounts' bill codes become one - the
   survivor's, carrying the default - as `uq_ebax_entity_xero_account` allows one per Xero account;
   two of them failed every Finish until 2026-11-13); unused unmatched accounts archived (never deleted); all
   logged in `account_change_log` (one batch); drafts deleted; `setup_mode = 'xero'` and
@@ -553,8 +557,10 @@ throttled the same way; Xero failing leaves the stored list, logged. Tests: `xer
 The doc "Minty Xero Sync & Report Decisions" (claude.ai artifact HV37p5LpnzconZBJEUD31n) sets these.
 
 - **The one merge (M1-M4), `xero/services/merge.py`.** `combine_accounts` / `combine_contacts` move
-  every record of the merged one to the kept one (expenses, bill lines - and, for a Settings merge,
-  their `account_code` - bills, daily closing's slots, `account_module`, `entity_account_xero`; a
+  every record of the merged one to the kept one (expenses, bill lines, bills, daily closing's slots,
+  `account_module`, `entity_account_xero`; every bill line on the kept account, published or not, then
+  takes its code and name and its bill the header code, and a kept contact's bills its name -
+  `xero/services/bill_text.py`, the user's rule 2026-11-24; a
   Settings merge also takes the merged account's bill code off Payment Settings), archive it with
   `merged_into_id` and write `minty_merge` plus a `minty_merge_record` per moved row (minty-db v0.14)
   besides the change logs. No new record, Xero not touched, no undo. Matching's Finish runs them

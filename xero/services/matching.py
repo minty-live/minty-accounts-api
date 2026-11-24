@@ -68,7 +68,7 @@ from minty_db.models import (
 )
 from minty_shared import names
 
-from xero.services import sync, usage
+from xero.services import bill_text, sync, usage
 from xero.services.connect import MirrorFailed
 
 logger = logging.getLogger("minty-accounts-api")
@@ -554,7 +554,9 @@ def _combine(entity_id, survivor: AccountInfo, others: list[AccountInfo], batch,
 
 
 def _link(entity_id, account: AccountInfo, copy: XeroAccount, batch, user_id, extra_codes=()) -> None:
-    """The account takes Xero's identity in place; its bill codes and unpublished bill lines follow."""
+    """The account takes Xero's identity in place; its bill codes and every bill line on it follow,
+    published ones included (the user's rule, 2026-11-24: records show the matched account; no
+    Xero call - ``bill_text``)."""
     before = (_code(account), account.name, _minty_type(account))
     new_type = _copy_type(copy) or _minty_type(account)
     AccountInfo.objects.filter(id=account.id).update(
@@ -577,8 +579,10 @@ def _link(entity_id, account: AccountInfo, copy: XeroAccount, batch, user_id, ex
                 account_code=copy.code or "", account_name=account.name, account_type=copy.xero_type,
                 xero_account_id=copy.xero_guid)
         blank.exclude(id=holder.id if holder else None).delete()
-        BillLine.objects.filter(bill__entity_id=entity_id, account_code__in=old_codes).exclude(
-            bill__published="published").update(account_code=copy.code or "", account_id=account.id)
+        # lines saved before bill_line.account_id existed name the account by code only
+        BillLine.objects.filter(bill__entity_id=entity_id, account_id__isnull=True,
+                                account_code__in=old_codes).update(account_id=account.id)
+    bill_text.refresh_accounts(entity_id, [account.id])
     EntityAccountXero.objects.filter(account_id=account.id).update(
         xero_account_id=copy.xero_guid, xero_org_id=copy.xero_org_id, name=account.name, type=copy.xero_type)
     # Minty used it, so it is one of the Xero accounts Minty uses (X2/X3's tick), and the sales
