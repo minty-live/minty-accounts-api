@@ -9,11 +9,17 @@ and the AI readers never suggest it. No new record is made and Xero is not touch
 ``minty_merge`` keeps the merge (from, to, who, when, why) and ``minty_merge_record`` every record
 that moved, so each one's original can always be found (M2); there is no undo in the app (M4).
 
-The ONE merge behaviour (M3): Xero matching's Finish (``matching._merge_supplier``) runs it with
-reason ``xero_matching``; the Settings Merge (``hub/company_chart.py``) runs ``merge_contacts``,
-reason ``user``; a contact Xero merged into one the company already has (C4) runs
-``merge_contacts``, reason ``merged_in_xero``. Callers hold the transaction and ``sync.lock``; the
-public merges take both.
+Matching and merging are separate (the user, 2026-11-25): matching never merges - a Xero contact
+another Minty contact already has is refused there (``CONTACT_TAKEN``), and the person merges the two
+first. The merge itself (M3) is run by:
+- the Settings Merge (``hub/company_chart.py``) - ``merge_contacts``, reason ``user``: several ticked
+  contacts absorbed into the one kept, always one of them; while Xero is connected only contacts not in
+  Xero (one in Xero is merged in Xero first, ``MERGE_IN_XERO``). While it is not, contacts linked to Xero
+  merge here too, and Xero keeps them as separate contacts (the user's pick, 2026-11-25: allowed, the
+  page says so);
+- Minty following a merge done in Xero (C4) - ``relink_contact``, reason ``merged_in_xero``, at
+  publish or at the sync (``sync.follow_xero_merges``).
+Callers hold the transaction and ``sync.lock``; the public merges take both.
 """
 
 from __future__ import annotations
@@ -37,8 +43,13 @@ from xero.services import bill_text, sync, usage
 logger = logging.getLogger("minty-accounts-api")
 
 NOT_FOUND = "That isn't one of this company's {kind}s any more. Reload the list and try again."
-SAME = "Choose two different {kind}s to merge."
-MERGED_AWAY = "{name} was already merged into another {kind}. Choose another one to keep."
+TICK_TWO = "Tick at least two contacts to merge."
+KEEP_TICKED = "Choose the one to keep from the contacts you ticked."
+MERGE_IN_XERO = ("In Xero already: {names}. Your company is connected to Xero, so merge them in Xero first, and "
+                 "Minty follows at the next sync.")
+#: Matching never merges (the user, 2026-11-25): the person merges the two contacts first.
+CONTACT_TAKEN = ("{name} already has that Xero contact. Merge the two in Settings first, or choose another "
+                 "contact.")
 
 
 class Refused(Exception):
@@ -106,25 +117,58 @@ def _active(model, entity_id, record_id):
                                 merged_into__isnull=True).first()
 
 
-def merge_contacts(entity_id, merged_id, kept_id, user_id, *, reason: str = "user") -> dict:
-    """``merged_id``'s records moved to ``kept_id`` (M1-M4). Raises ``Refused``."""
-    if str(merged_id) == str(kept_id):
-        raise Refused(SAME.format(kind="contact"), 400)
+def _and(names: list[str]) -> str:
+    return names[0] if len(names) == 1 else f"{', '.join(names[:-1])} and {names[-1]}"
+
+
+def merge_contacts(entity_id, ids, keep_id, user_id) -> dict:
+    """The Settings Merge (the user, 2026-11-25): every ticked contact absorbed into ``keep_id`` - one
+    of them, never a new contact (M1-M4). While Xero is connected a contact in Xero is merged in Xero
+    first; while it is not, one linked to Xero merges here and Xero keeps it as a separate contact (the
+    page says so - the user, 2026-11-25). Raises ``Refused``."""
+    from minty_db.models import Entity
+
+    ticked = list(dict.fromkeys(str(i) for i in ids))
+    if len(ticked) < 2:
+        raise Refused(TICK_TWO, 400)
+    if str(keep_id) not in ticked:
+        raise Refused(KEEP_TICKED, 400)
     with transaction.atomic():
         sync.lock(entity_id)
-        merged = _active(XeroContactSync, entity_id, merged_id)
-        kept = XeroContactSync.objects.filter(entity_id=entity_id, id=kept_id).first()
-        if merged is None or kept is None:
+        rows = {str(r.id): r for r in XeroContactSync.objects.filter(
+            entity_id=entity_id, id__in=ticked, record_status="active", merged_into__isnull=True)}
+        if len(rows) != len(ticked):
             raise Refused(NOT_FOUND.format(kind="contact"), 404)
-        if kept.merged_into_id is not None:
-            raise Refused(MERGED_AWAY.format(name=kept.name, kind="contact"))
-        if kept.record_status != "active":
-            raise Refused(NOT_FOUND.format(kind="contact"), 404)
-        moved = combine_contacts(entity_id, kept, merged, uuid.uuid4(), user_id, reason=reason)
-    return {"moved": moved, "message": f"{merged.name} merged into {kept.name}."}
+        entity = Entity.objects.get(id=entity_id)
+        if entity.status == "connected" and entity.xero_org_id:
+            in_xero = [rows[i].name for i in ticked
+                       if rows[i].xero_contact_id and rows[i].xero_org_id == str(entity.xero_org_id)]
+            if in_xero:
+                raise Refused(MERGE_IN_XERO.format(names=_and(in_xero)))
+        kept = rows[str(keep_id)]
+        merged = [rows[i] for i in ticked if i != str(keep_id)]
+        batch, moved = uuid.uuid4(), {}
+        for row in merged:
+            for table, count in combine_contacts(entity_id, kept, row, batch, user_id, reason="user").items():
+                moved[table] = moved.get(table, 0) + count
+    return {"kept": str(kept.id), "moved": moved,
+            "message": f"{_and([m.name for m in merged])} merged into {kept.name}. {kept.name} stays."}
 
 
 # ---- a contact Xero archived (owner's decisions doc C4) ---------------------------------------------
+
+#: A Xero contact held by a contact merged away in Minty (merged while Xero was off, 2026-11-25).
+TAKEN_BY_MERGED = ("That Xero contact belongs to {name}, which was merged into {kept} in Minty. Merge them in Xero "
+                   "too, or choose another contact.")
+
+
+def taken_by_archived(holder: XeroContactSync) -> str:
+    """Why a Xero contact held by an archived contact can't be picked: merged away, or deleted."""
+    if holder.merged_into_id is not None:
+        kept = XeroContactSync.objects.filter(id=holder.merged_into_id).values_list("name", flat=True).first()
+        return TAKEN_BY_MERGED.format(name=holder.name, kept=kept or "another contact")
+    return TAKEN_BY_ARCHIVED.format(name=holder.name)
+
 
 TAKEN_BY_ARCHIVED = ("That Xero contact belongs to {name}, which this company deleted. Add {name} back, or "
                      "choose another contact.")
@@ -132,9 +176,11 @@ TAKEN_BY_ARCHIVED = ("That Xero contact belongs to {name}, which this company de
 
 def relink_contact(entity_id, contact_id, xero_guid: str, user_id, *, reason: str) -> dict:
     """The company's contact pointed at another Xero contact: the one Xero merged it into
-    (``merged_in_xero``, at publish, no prompt) or the one the person picked (``user``, "map it
-    now"). When that Xero contact is already a different Minty contact, the two are merged - the
-    records move to that one and the merge is kept in the merging table. Raises ``Refused``."""
+    (``merged_in_xero``, at publish or at the sync, no prompt) or the one the person picked (``user``,
+    "map it now"). When that Xero contact is already a different Minty contact: following Xero's merge,
+    the two are merged - the records move to that one and the merge is kept in the merging table; a
+    person's pick is refused (``CONTACT_TAKEN``) - matching never merges (the user, 2026-11-25).
+    Raises ``Refused``."""
     from minty_db.models import Entity, XeroContact
 
     with transaction.atomic():
@@ -146,7 +192,9 @@ def relink_contact(entity_id, contact_id, xero_guid: str, user_id, *, reason: st
                   .exclude(id=contact.id).first())
         if holder is not None:
             if holder.record_status != "active" or holder.merged_into_id is not None:
-                raise Refused(TAKEN_BY_ARCHIVED.format(name=holder.name))
+                raise Refused(taken_by_archived(holder))
+            if reason != "merged_in_xero":
+                raise Refused(CONTACT_TAKEN.format(name=holder.name))
             moved = combine_contacts(entity_id, holder, contact, uuid.uuid4(), user_id, reason=reason)
             return {"contact_id": str(holder.id), "xero_contact_id": xero_guid, "merged": True, "moved": moved}
         org = Entity.objects.filter(id=entity_id).values_list("xero_org_id", flat=True).first()

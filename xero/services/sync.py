@@ -21,6 +21,14 @@ times each time Petty Cash Settings opened; this asks once and does all of it:
   ``overwritten`` (Xero's code, name and type before and after, ``changed_by`` NULL), and a Minty
   account Xero takes over by code and type ``linked``. Xero's code goes in ``xero_code``; the Minty
   code (``code``) stays - the schema fills it from Xero's only while it is empty (minty-db v0.18).
+- **Minty follows a merge done in Xero** (the user, 2026-11-25: merging is Minty's only for contacts
+  not in Xero; the others are merged in Xero first). Xero's contact list leaves out archived contacts,
+  and only ``GET /Contacts/{id}`` names ``MergedToContactID``: each linked contact missing from the list
+  is asked for by id (``follow_xero_merges``, at most ``FOLLOW_MERGES_PER_RUN`` a run) and one Xero
+  merged follows Xero's kept contact - relinked, or merged into the Minty contact that has it
+  (``merge.relink_contact``, reason ``merged_in_xero``). This runs before new contacts are added, so
+  Xero's kept contact is never made a second row first. One archived with no merge is left for publish
+  to ask about (C4).
 - ``entity_account_xero`` (Petty Cash's code list) gains a row per eligible account; the ticks
   (``is_active``) are never changed here.
 - ``entity_bill_account_xero`` (Payment Requests' list) likewise, and loses rows whose account is gone.
@@ -68,6 +76,8 @@ TIMEOUT = (10, 60)
 CONTACTS_PAGE = 1000
 #: Opening Settings reads Xero at most this often per company (owner's decisions doc C2, 2026-11-19).
 SETTINGS_READ_EVERY = timedelta(minutes=2)
+#: Contacts a sync asks Xero about one by one to follow Xero's merges (Xero allows 60 calls a minute).
+FOLLOW_MERGES_PER_RUN = 25
 #: Types Petty Cash's chart never shows (Flask's ``COA_EXCLUDED_TYPES``): their names aren't refreshed.
 COA_EXCLUDED_TYPES = frozenset({"BANK", "EQUITY", "OTHERINCOME", "SALES", "REVENUE"})
 #: ``account_info.source`` of a row Minty made (Auto Fill, or added by a person): never deleted here.
@@ -129,6 +139,63 @@ def fetch_contacts(access_token: str, org) -> list[dict] | None:
         if len(found) < CONTACTS_PAGE:
             return contacts
         page += 1
+
+
+def contact_by_id(access_token: str, org, guid: str) -> dict | None:
+    """Xero's contact ``guid`` as ``GET /Contacts/{id}`` answers it (``ContactStatus``,
+    ``MergedToContactID``), or None when Xero no longer has it. Raises ``requests.RequestException``
+    on any other answer."""
+    response = requests.get(f"{settings.XERO_API_BASE_URL}/Contacts/{guid}", headers=_headers(access_token, org),
+                            timeout=TIMEOUT)
+    if response.status_code == 404:
+        return None
+    if response.status_code != 200:
+        raise requests.RequestException(f"Xero answered {response.status_code} for contact {guid}")
+    found = (response.json() or {}).get("Contacts") or []
+    return found[0] if found else None
+
+
+def follow_xero_merges(entity_id, access_token: str, org, contacts: list[dict]) -> int:
+    """Each linked contact Xero's list no longer has, asked for by id: one Xero merged follows the
+    contact Xero kept (``merge.relink_contact``, ``merged_in_xero``). Returns how many followed."""
+    from minty_db.models import XeroContactSync as Contact
+
+    from xero.services import merge
+
+    listed = {c.get("ContactID") for c in contacts if c.get("ContactID")}
+    missing = list(Contact.objects.filter(entity_id=entity_id, xero_org_id=str(org), record_status="active",
+                                          merged_into__isnull=True)
+                   .exclude(xero_contact_id__isnull=True).exclude(xero_contact_id="")
+                   .exclude(xero_contact_id__in=listed).order_by("name", "id")[:FOLLOW_MERGES_PER_RUN + 1])
+    if len(missing) > FOLLOW_MERGES_PER_RUN:
+        logger.info("xero sync: company %s has more than %s contacts gone from Xero's list; the rest next sync",
+                    entity_id, FOLLOW_MERGES_PER_RUN)
+    followed = 0
+    for row in missing[:FOLLOW_MERGES_PER_RUN]:
+        try:
+            found = contact_by_id(access_token, org, row.xero_contact_id)
+        except (requests.RequestException, ValueError) as exc:
+            logger.error("xero sync: company %s - Xero didn't answer for contact %s (%s); merges not followed",
+                         entity_id, row.xero_contact_id, exc)
+            break
+        target = str((found or {}).get("MergedToContactID") or "").strip()
+        if not target or target == row.xero_contact_id:
+            continue  # archived with no merge, or gone: publish asks (C4)
+        try:
+            merge.relink_contact(entity_id, row.id, target, None, reason="merged_in_xero")
+            followed += 1
+        except merge.Refused as refusal:
+            logger.warning("xero sync: company %s contact %s not following Xero's merge into %s: %s", entity_id,
+                           row.id, target, refusal.message)
+    return followed
+
+
+def _contacts(entity_id, access_token, org, contacts: list[dict] | None) -> dict | None:
+    """Xero's merges followed first, then the list applied (``apply_contacts``)."""
+    if contacts is None:
+        return None
+    followed = follow_xero_merges(entity_id, access_token, org, contacts)
+    return {**apply_contacts(entity_id, contacts, org), "followed_merges": followed}
 
 
 def lock(entity_id) -> None:
@@ -463,7 +530,7 @@ def sync_company(entity_id, access_token: str, org) -> dict:
 
         return {
             "accounts": matching.sync_during_change(entity_id, accounts, org) if accounts else None,
-            "contacts": apply_contacts(entity_id, contacts, org) if contacts is not None else None,
+            "contacts": _contacts(entity_id, access_token, org, contacts),
         }
     if Entity.objects.filter(id=entity_id).filter(
             models.Q(setup_mode="minty") | models.Q(xero_matching__isnull=False)).exists():
@@ -485,5 +552,5 @@ def sync_company(entity_id, access_token: str, org) -> dict:
     # Xero when it is added while connected (C5) or at its first publish (C1), never here.
     return {
         "accounts": apply_accounts(entity_id, accounts, org) if accounts else None,
-        "contacts": apply_contacts(entity_id, contacts, org) if contacts is not None else None,
+        "contacts": _contacts(entity_id, access_token, org, contacts),
     }

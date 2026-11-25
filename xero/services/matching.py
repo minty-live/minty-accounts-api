@@ -29,8 +29,9 @@ yet in the organisation takes a Xero contact (the one of its name is picked for 
 creates nothing in Xero, C2). Each daily-closing contact still empty takes a Xero contact (Xero's
 books need all three; ``pettycash_contacts_missing``). Picks save at once (``contact_match_draft``),
 Finish is refused while one has no answer, and Finish applies them in its transaction: linked
-(``contact_change_log``), or merged into the Minty contact that already holds that Xero contact
-(contacts still merge), and the daily-closing slots set.
+(``contact_change_log``) and the daily-closing slots set. Matching never merges (the user,
+2026-11-25): a Xero contact another Minty contact already has is shown held and refused
+(``merge.CONTACT_TAKEN``) - the person merges the two contacts first.
 
 **Phase 3 (owner, 2026-11-12).** ``entities.xero_matching`` (minty-db v0.6) marks an open matching
 and why: ``first`` (the above), ``new_accounts`` (a reconnect to the same organisation found accounts
@@ -175,9 +176,16 @@ def _active_accounts(entity_id):
 def scope_accounts(entity_id, org, reason):
     """The accounts a matching for ``reason`` covers. ``first``: the company's own accounts (Phase 2 -
     in Minty's books, every one); any other: every active account (the user, 2026-11-24: every account
-    needs a Xero account, and a reconnect shows them all - those linked to ``org`` prefilled)."""
+    needs a Xero account, and a reconnect shows them all - those linked to ``org`` prefilled).
+    ``new_org`` also covers each archived account a record uses (the user, 2026-11-25: the chart is the
+    current organisation's), so none is left on the old organisation's Xero account."""
     if reason == "first" or not reason:
         return own_accounts(entity_id)
+    if reason == "new_org":
+        archived_in_use = Q(id__in=usage.used_account_ids(entity_id)) & (
+            Q(record_status="archived") | Q(status="ARCHIVED"))
+        return AccountInfo.objects.filter(entity_id=entity_id, merged_into__isnull=True).filter(
+            Q(id__in=_active_accounts(entity_id).values("id")) | archived_in_use)
     return _active_accounts(entity_id)
 
 
@@ -190,7 +198,7 @@ def needs_matching(entity: Entity, tenant_id=None) -> str | None:
     if not tenant_id or not entity.xero_org_id:
         return None
     if str(entity.xero_org_id) != str(tenant_id):
-        return "new_org" if _active_accounts(entity.id).exists() else None
+        return "new_org" if scope_accounts(entity.id, tenant_id, "new_org").exists() else None
     if entity.setup_mode == "xero" and own_accounts(entity.id).exists():
         return "new_accounts"
     return None
@@ -359,11 +367,24 @@ def _drop_stale_contact_drafts(entity_id, org, reason) -> None:
     ContactMatchDraft.objects.filter(entity_id=entity_id).exclude(id__in=keep).delete()
 
 
+def _held_contacts(entity_id, suppliers, by_contact) -> tuple[dict, dict]:
+    """Who already has each Xero contact (matching and merging are separate - the user, 2026-11-25):
+    by Xero id, the Minty contact linked to it (outside the step); by copy id, the supplier whose pick
+    it is. Such a contact is never picked for another supplier - the person merges the two first."""
+    in_scope = {s.id for s in suppliers}
+    linked = {r.xero_contact_id: r for r in XeroContactSync.objects.filter(entity_id=entity_id).exclude(
+        xero_contact_id__isnull=True).exclude(xero_contact_id="").exclude(id__in=in_scope)}
+    names_of = {s.id: s.name for s in suppliers}
+    picked = {d.xero_contact_id: names_of[cid] for cid, d in by_contact.items() if d.xero_contact_id}
+    return linked, picked
+
+
 def auto_pick_contacts(entity_id, org, reason="first") -> int:
     """Each supplier without a pick takes the Xero contact of its name (case, spaces and punctuation
-    ignored), when there is one."""
+    ignored), when there is one and no other contact has it."""
     suppliers, slots = contact_scope(entity_id, org, reason)
     by_contact, _ = _contact_drafts(entity_id, suppliers, slots)
+    linked, picked = _held_contacts(entity_id, suppliers, by_contact)
     by_name: dict = {}
     for copy in _contact_copies(entity_id, org):
         key = names.name_key(copy.name)
@@ -372,9 +393,11 @@ def auto_pick_contacts(entity_id, org, reason="first") -> int:
     made = 0
     for supplier in suppliers:
         copy = by_name.get(names.name_key(supplier.name) or None)
-        if supplier.id not in by_contact and copy is not None:
+        if (supplier.id not in by_contact and copy is not None and copy.xero_guid not in linked
+                and copy.id not in picked):
             ContactMatchDraft.objects.create(entity_id=entity_id, contact_id=supplier.id, xero_contact_id=copy.id,
                                              picked_by=None)
+            picked[copy.id] = supplier.name
             made += 1
     return made
 
@@ -387,10 +410,16 @@ def _contacts_blocking(entity_id, org, reason) -> int:
 
 def read_contacts(entity: Entity) -> dict:
     """The contacts step: each supplier and daily-closing contact to answer, its pick, the Xero
-    contacts to pick from."""
+    contacts to pick from - each with ``held_by``, the contact that already has it (a supplier can't
+    pick one another contact has; a daily-closing slot can)."""
     org, reason = entity.xero_org_id, entity.xero_matching
     suppliers, slots = contact_scope(entity.id, org, reason)
     by_contact, by_slot = _contact_drafts(entity.id, suppliers, slots)
+    linked, picked = _held_contacts(entity.id, suppliers, by_contact)
+
+    def held_by(copy):
+        holder = linked.get(copy.xero_guid)
+        return holder.name if holder is not None else picked.get(copy.id)
 
     def answer(draft):
         if draft is None:
@@ -403,8 +432,8 @@ def read_contacts(entity: Entity) -> dict:
         "suppliers": [{"contact_id": str(s.id), "name": s.name, "pick": answer(by_contact.get(s.id))}
                       for s in suppliers],
         "slots": [{"slot": slot, "pick": answer(by_slot.get(slot))} for slot in slots],
-        "options": [{"id": str(c.id), "name": c.name} for c in (_contact_copies(entity.id, org) if suppliers or slots
-                                                                  else [])],
+        "options": [{"id": str(c.id), "name": c.name, "held_by": held_by(c)}
+                    for c in (_contact_copies(entity.id, org) if suppliers or slots else [])],
         "blocking": (len(suppliers) - len(by_contact)) + (len(slots) - len(by_slot)),
     }
 
@@ -629,7 +658,7 @@ def pick(entity_id, account_id, xero_account_id, user_id) -> dict:
 def pick_contact(entity_id, user_id, *, contact_id=None, slot=None, xero_contact_id=None, new=False) -> dict:
     """Save (or, with no answer, clear) one answer of the contacts step: a supplier's Xero contact or
     "new in Xero", or a daily-closing contact's Xero contact."""
-    from xero.services.merge import TAKEN_BY_ARCHIVED
+    from xero.services.merge import CONTACT_TAKEN, taken_by_archived
 
     entity = _pending_entity(entity_id)
     suppliers, slots = contact_scope(entity_id, entity.xero_org_id, entity.xero_matching)
@@ -655,7 +684,16 @@ def pick_contact(entity_id, user_id, *, contact_id=None, slot=None, xero_contact
         holder = (XeroContactSync.objects.filter(entity_id=entity_id, xero_contact_id=copy.xero_guid)
                   .exclude(id=contact_id).first())
         if holder is not None and (holder.record_status != "active" or holder.merged_into_id is not None):
-            raise Refused(TAKEN_BY_ARCHIVED.format(name=holder.name))
+            raise Refused(taken_by_archived(holder))
+        if supplier is not None:
+            # matching never merges (the user, 2026-11-25): another contact has it - merge the two first
+            if holder is not None:
+                raise Refused(CONTACT_TAKEN.format(name=holder.name))
+            other = (ContactMatchDraft.objects.filter(entity_id=entity_id, xero_contact_id=copy.id,
+                                                      contact_id__isnull=False).exclude(contact_id=contact_id).first())
+            if other is not None:
+                name = next((s.name for s in suppliers if s.id == other.contact_id), None)
+                raise Refused(CONTACT_TAKEN.format(name=name or "Another contact"))
     with transaction.atomic():
         mine.delete()
         if copy is not None or new:
@@ -825,10 +863,11 @@ def finish(entity_id, user_id) -> dict:
 
 
 def _apply_contacts(entity: Entity, batch, user_id) -> dict:
-    """The contacts step's answers, in Finish's transaction: each supplier linked to its Xero contact
-    (or merged into the Minty contact that already has it), a new one left for its first publish;
-    each daily-closing contact set to its Xero contact's row (made from the copy when there is none)."""
-    from xero.services.merge import TAKEN_BY_ARCHIVED
+    """The contacts step's answers, in Finish's transaction: each supplier linked to its Xero contact,
+    a new one left for its first publish; each daily-closing contact set to its Xero contact's row (made
+    from the copy when there is none). A Xero contact another Minty contact already has refuses Finish -
+    matching never merges (the user, 2026-11-25)."""
+    from xero.services.merge import CONTACT_TAKEN, taken_by_archived
 
     org = str(entity.xero_org_id)
     suppliers, slots = contact_scope(entity.id, entity.xero_org_id, entity.xero_matching)
@@ -838,7 +877,7 @@ def _apply_contacts(entity: Entity, batch, user_id) -> dict:
                                                           status="ACTIVE")}
     if any(i not in copies for i in picked):
         raise Refused(CONTACT_GONE)
-    counts = {"linked": 0, "merged": 0, "new": 0, "slots": 0}
+    counts = {"linked": 0, "new": 0, "slots": 0}
     for supplier in suppliers:
         draft = by_contact[supplier.id]
         if draft.add_to_xero:
@@ -849,12 +888,10 @@ def _apply_contacts(entity: Entity, batch, user_id) -> dict:
                   .exclude(id=supplier.id).first())
         if stored is not None:
             if stored.record_status != "active" or stored.merged_into_id is not None:
-                raise Refused(TAKEN_BY_ARCHIVED.format(name=stored.name))
-            _merge_supplier(entity.id, supplier, stored, batch, user_id)
-            counts["merged"] += 1
-        else:
-            _link_supplier(entity.id, supplier, copy.xero_guid, copy.name, org, batch, user_id, "linked")
-            counts["linked"] += 1
+                raise Refused(taken_by_archived(stored))
+            raise Refused(CONTACT_TAKEN.format(name=stored.name))
+        _link_supplier(entity.id, supplier, copy.xero_guid, copy.name, org, batch, user_id, "linked")
+        counts["linked"] += 1
     columns = dict(PETTYCASH_CONTACTS)
     for slot in slots:
         copy = copies[by_slot[slot].xero_contact_id]
@@ -863,7 +900,7 @@ def _apply_contacts(entity: Entity, batch, user_id) -> dict:
             holder = XeroContactSync.objects.create(entity_id=entity.id, xero_contact_id=copy.xero_guid, xero_org_id=org,
                                                     name=copy.name[:150], xero_contact_link_id=copy.id)
         elif holder.record_status != "active" or holder.merged_into_id is not None:
-            raise Refused(TAKEN_BY_ARCHIVED.format(name=holder.name))
+            raise Refused(taken_by_archived(holder))
         EntityPettycashSettings.objects.filter(entity_id=entity.id).update(**{columns[slot]: holder.id})
         counts["slots"] += 1
     ContactMatchDraft.objects.filter(entity_id=entity.id).delete()
@@ -871,14 +908,6 @@ def _apply_contacts(entity: Entity, batch, user_id) -> dict:
 
 
 # ---- suppliers (frames 4, 5) ------------------------------------------------------------------------
-
-
-def _merge_supplier(entity_id, supplier: XeroContactSync, into: XeroContactSync, batch, user_id) -> None:
-    """A supplier whose Xero contact is already stored here: its records move to that row - the one
-    merge (``merge.combine_contacts``, owner's decisions doc M3)."""
-    from xero.services import merge
-
-    merge.combine_contacts(entity_id, into, supplier, batch, user_id, reason="xero_matching")
 
 
 def _link_supplier(entity_id, supplier, guid, name, org, batch, user_id, kind) -> None:
@@ -898,8 +927,9 @@ def link_suppliers(entity_id, access_token, org, user_id) -> list[str]:
     every own supplier linked to the Xero contact of its name (case, spaces and punctuation ignored -
     ``minty_shared.names``, the user 2026-11-23); one with no such contact stays in Minty and goes to
     Xero at its first publish - connecting creates nothing in Xero (owner's decisions doc C2,
-    2026-11-19). Each in its own transaction. Returns no names: nothing can be refused (the list stays
-    for the routes' answer)."""
+    2026-11-19). One whose Xero contact another Minty contact already has stays unlinked - matching never
+    merges (the user, 2026-11-25). Each in its own transaction. Returns no names: nothing can be refused
+    (the list stays for the routes' answer)."""
     contacts = sync.fetch_contacts(access_token, org)
     if contacts is None:
         raise Refused(CONTACTS_UNANSWERED, 502)
@@ -919,13 +949,14 @@ def link_suppliers(entity_id, access_token, org, user_id) -> list[str]:
         if match is None:
             left += 1  # not in Xero: it goes there at its first publish
             continue
+        guid = match["ContactID"]
+        if XeroContactSync.objects.filter(entity_id=entity_id, xero_contact_id=guid).exists():
+            left += 1  # another contact has it: the person merges the two (never matching)
+            logger.info("xero matching: company %s supplier %s left unlinked - Xero contact %s is another "
+                        "contact's", entity_id, supplier.id, guid)
+            continue
         with transaction.atomic():
-            guid = match["ContactID"]
-            stored = XeroContactSync.objects.filter(entity_id=entity_id, xero_contact_id=guid).first()
-            if stored is not None:
-                _merge_supplier(entity_id, supplier, stored, batch, user_id)
-            else:
-                _link_supplier(entity_id, supplier, guid, match.get("Name"), org, batch, user_id, "linked")
+            _link_supplier(entity_id, supplier, guid, match.get("Name"), org, batch, user_id, "linked")
     logger.info("xero matching: company %s suppliers linked by name; %s stay in Minty until a publish", entity_id,
                 left)
     return []

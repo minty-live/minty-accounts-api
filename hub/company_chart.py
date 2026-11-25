@@ -11,10 +11,10 @@ Its answer and status come back as they are; onboarding-api checks the person's 
 Viewing is ``COA_VIEW`` (cashier and up); adding, changing and deleting accounts and contacts are
 ``COA_CREATE`` / ``COA_UPDATE`` / ``COA_DELETE`` (accountant and up).
 
-``POST .../contacts/<id>/merge {"into": <id>}`` merges two contacts here, not in onboarding-api:
-the merge is accounts-api's one implementation (``xero/services/merge.py``, the owner's decisions doc
-M1-M4), shared with Xero matching. ``COA_DELETE`` - a merge takes one away. Accounts are never merged
-(the user, 2026-11-24).
+``POST .../contacts/merge {"ids": [<id>, ...], "keep": <id>}`` merges contacts here, not in
+onboarding-api: several ticked contacts absorbed into the one kept (the user, 2026-11-25), accounts-api's
+one implementation (``xero/services/merge.py``, the owner's decisions doc M1-M4). ``COA_DELETE`` - a
+merge takes some away. Accounts are never merged (the user, 2026-11-24).
 
 Opening the contact list reads the company's contacts from Xero first - read only, at most once
 every 2 minutes (owner's decisions doc C2, 2026-11-19), as Petty Cash Settings does.
@@ -134,22 +134,20 @@ MERGE_DENIED = "You don't have permission to merge this company's contacts."
 PICK_ONE = "Choose which one to keep, then merge."
 
 
-def _merge(request: HttpRequest, record_id: str, merge) -> HttpResponse:
+def company_contacts_merge(request: HttpRequest) -> HttpResponse:
+    """``POST {ids, keep}``: the ticked contacts merged into the one kept (``merge.merge_contacts``)."""
     if request.method not in ("POST", "OPTIONS"):
         return refuse(request, "Method not allowed", 405)
     early, user, entity_id = _open(request, Permission.COA_DELETE, MERGE_DENIED)
     if early is not None:
         return early
-    merged_id, kept_id = _uuid(record_id), _uuid(_body(request).get("into"))
-    if merged_id is None:
-        return refuse(request, merging.NOT_FOUND.format(kind="record"), 404)
-    if kept_id is None:
+    data = _body(request)
+    ids, keep = data.get("ids"), _uuid(data.get("keep"))
+    if not isinstance(ids, list) or any(_uuid(i) is None for i in ids):
+        return refuse(request, merging.TICK_TWO, 400)
+    if keep is None:
         return refuse(request, PICK_ONE, 400)
     try:
-        return respond(request, merge(entity_id, merged_id, kept_id, user.id))
+        return respond(request, merging.merge_contacts(entity_id, [_uuid(i) for i in ids], keep, user.id))
     except merging.Refused as refusal:
         return refuse(request, refusal.message, refusal.status)
-
-
-def company_contact_merge(request: HttpRequest, contact_id: str) -> HttpResponse:
-    return _merge(request, contact_id, merging.merge_contacts)

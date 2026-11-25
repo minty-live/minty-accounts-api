@@ -50,6 +50,8 @@ class FakeXero:
         self.fail_contacts_page: int | None = None
         self.asked: list[tuple[str, dict]] = []
         self.made: list[str] = []
+        #: GET /Contacts/{id}: the contacts Xero's list leaves out (archived, merged), by id
+        self.by_id: dict[str, dict] = {}
 
     def post(self, url, headers=None, json=None, timeout=None, **_):
         """A contact made in Xero (matching._create_in_xero): its id is ``made-<name>``."""
@@ -64,6 +66,9 @@ class FakeXero:
         if url.endswith("/Accounts"):
             assert params == {"where": 'Status=="ACTIVE"'}
             return _Resp(500, {}) if self.accounts is None else _Resp(200, {"Accounts": self.accounts})
+        if "/Contacts/" in url:
+            guid = url.rsplit("/", 1)[-1]
+            return _Resp(200, {"Contacts": [self.by_id[guid]]}) if guid in self.by_id else _Resp(404, {})
         page = params["page"]
         if page == self.fail_contacts_page:
             return _Resp(503, {})
@@ -195,7 +200,7 @@ def test_contacts_are_added_and_renamed_never_removed(company, xero):
     XeroContactSync.objects.create(entity_id=company.id, xero_contact_id="c-gone", name="Archived In Xero")
     xero.contact_pages = [[{"ContactID": "c-1", "Name": "New Name"}, {"ContactID": "c-2", "Name": "ABC Supplies"}]]
 
-    assert _run(company)["contacts"] == {"added": 1, "linked": 0, "renamed": 1}
+    assert _run(company)["contacts"] == {"added": 1, "linked": 0, "renamed": 1, "followed_merges": 0}
     names = dict(XeroContactSync.objects.filter(entity_id=company.id).values_list("xero_contact_id", "name"))
     assert names == {"c-1": "New Name", "c-2": "ABC Supplies", "c-gone": "Archived In Xero"}
     assert XeroContactSync.objects.get(xero_contact_id="c-2").xero_org_id == TENANT
@@ -237,7 +242,7 @@ def test_the_route_syncs_the_assertions_company(db, xero):
 
     assert resp.status_code == 200
     assert resp.json() == {"accounts": {"added": 1, "linked": 0, "activated": 0, "refreshed": 0, "archived": 0, "deleted": 0},
-                           "contacts": {"added": 0, "linked": 0, "renamed": 0}}
+                           "contacts": {"added": 0, "linked": 0, "renamed": 0, "followed_merges": 0}}
 
 
 def test_a_settings_read_runs_at_most_once_every_two_minutes(db, xero):
@@ -579,3 +584,57 @@ def test_a_minty_account_xero_takes_over_by_code_and_type_is_logged_linked(compa
     own.refresh_from_db()
     assert (own.xero_account_id, own.code, own.xero_code) == ("a-469", "6200", "469")
     assert list(AccountChangeLog.objects.filter(account_id=own.id).values_list("kind", flat=True)) == ["linked"]
+
+
+# ---- Minty follows a merge done in Xero at the next sync (the user, 2026-11-25) -----------------------
+
+
+def test_a_contact_xero_merged_is_followed_at_the_next_sync(company, xero):
+    """Xero's list leaves out archived contacts; a linked one missing from it is asked for by id, and
+    one Xero merged follows Xero's kept contact - relinked, or merged into the Minty contact that has
+    it. One archived with no merge is left for publish to ask about (C4)."""
+    from minty_db.models import MintyMerge, Report, ReportExpense
+
+    kept = XeroContactSync.objects.create(entity_id=company.id, name="Kee Wah", xero_contact_id="c-kept",
+                                          xero_org_id=TENANT)
+    merged = XeroContactSync.objects.create(entity_id=company.id, name="Kee Wah Bakery", xero_contact_id="c-gone",
+                                            xero_org_id=TENANT)
+    moved = XeroContactSync.objects.create(entity_id=company.id, name="ABC", xero_contact_id="c-abc-old",
+                                           xero_org_id=TENANT)
+    archived = XeroContactSync.objects.create(entity_id=company.id, name="Old Co", xero_contact_id="c-old",
+                                              xero_org_id=TENANT)
+    report = Report.objects.create(entity_id=company.id, transaction_date="2026-11-25")
+    ReportExpense.objects.create(report_id=report.id, contact_id=merged.id, amount=1)
+    xero.accounts = [acct("a-1", "429", "General")]
+    xero.contact_pages = [[{"ContactID": "c-kept", "Name": "Kee Wah"}, {"ContactID": "c-abc", "Name": "ABC"}]]
+    xero.by_id = {
+        "c-gone": {"ContactID": "c-gone", "ContactStatus": "ARCHIVED", "MergedToContactID": "c-kept"},
+        "c-abc-old": {"ContactID": "c-abc-old", "ContactStatus": "ARCHIVED", "MergedToContactID": "c-abc"},
+        "c-old": {"ContactID": "c-old", "ContactStatus": "ARCHIVED"},
+    }
+
+    result = _run(company)
+
+    assert result["contacts"]["followed_merges"] == 2
+    merged.refresh_from_db()
+    assert (merged.record_status, merged.merged_into_id) == ("archived", kept.id)
+    assert ReportExpense.objects.get(report_id=report.id).contact_id == kept.id
+    assert MintyMerge.objects.get(merged_id=merged.id).reason == "merged_in_xero"
+    moved.refresh_from_db()
+    assert (moved.xero_contact_id, moved.merged_into_id) == ("c-abc", None), "relinked, nothing to merge"
+    archived.refresh_from_db()
+    assert (archived.xero_contact_id, archived.record_status) == ("c-old", "active")
+    assert sorted(a for a, _ in xero.asked if a.startswith("c-")) == ["c-abc-old", "c-gone", "c-old"]
+
+
+def test_following_xero_merges_asks_at_most_so_many_contacts_a_run(company, xero, monkeypatch):
+    monkeypatch.setattr(sync, "FOLLOW_MERGES_PER_RUN", 2)
+    for i in range(4):
+        XeroContactSync.objects.create(entity_id=company.id, name=f"Gone {i}", xero_contact_id=f"c-{i}",
+                                       xero_org_id=TENANT)
+    xero.accounts = [acct("a-1", "429", "General")]
+    xero.contact_pages = [[]]
+
+    _run(company)
+
+    assert len([a for a, _ in xero.asked if a.startswith("c-")]) == 2

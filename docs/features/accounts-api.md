@@ -508,17 +508,23 @@ pointing at nothing.
   - each daily-closing contact still empty (`slots`: `cash_sale`, `director`, `discrepancy` - no
     `cash_sale` when every sale is banked, none without a settings row; Xero's books need them,
     petty-cash-api `xero_settings.PETTYCASH_SLOTS`), which always takes a Xero contact;
-  - the Xero contacts to pick from (active copies), and `blocking`.
+  - the Xero contacts to pick from (active copies), each with `held_by`: the Minty contact linked to it,
+    or the supplier whose pick it is. **Matching never merges** (the user, 2026-11-25):
+    - a held one is never picked for a supplier: `auto_pick_contacts` skips it and `PATCH` refuses it
+      (409 `merge.CONTACT_TAKEN`, "... Merge the two in Settings first, or choose another contact.");
+    - a daily-closing slot may take it (that is no merge);
+  - and `blocking`.
 
   At Finish:
-  - A supplier is linked (`contact_change_log`). When another Minty contact already has its Xero
-    contact, it is merged into that one (contacts still merge). One held by a deleted contact is
-    refused (`merge.TAKEN_BY_ARCHIVED`).
+  - A supplier is linked (`contact_change_log`). A Xero contact another Minty contact already has
+    refuses Finish (`CONTACT_TAKEN`; one held by a deleted contact, `merge.TAKEN_BY_ARCHIVED`), nothing
+    written - the person merges the two contacts first.
   - A slot is set to its Xero contact's row, made from the copy when there is none.
   - **Connecting creates nothing in Xero** (owner's decisions doc C2, 2026-11-19).
   - A change of the matches asks no contacts (`required: false`).
   - `POST .../contacts` (Try again) is left for a company the old rules (before 2026-11-19) still hold
-    disconnected: it links by name and connects it.
+    disconnected: it links by name and connects it. A name whose Xero contact another Minty contact has
+    is left unlinked, never merged.
 - **Daily closing's contacts** (production, 2026-11-23): a Minty company's daily closing had none, and
   Publish refused after Finish. They are the contacts step's now. Finish's answer still carries
   `pettycash_contacts_missing` (`[]` after the step).
@@ -534,7 +540,10 @@ pointing at nothing.
   the same organisation with an account not linked yet (made in Minty meanwhile) → `new_accounts`. The
   scope (`scope_accounts`) is every active account (the user, 2026-11-24: a reconnect shows them all;
   the ones linked to the current organisation prefilled - `_prefill_links`); `first` is the company's
-  own accounts. **Change matches**: `POST .../matching/change` (connected, `XERO_SETTINGS_UPDATE`)
+  own accounts. `new_org` also covers every archived account (in Xero or in Minty) that a record uses
+  (`usage.used_account_ids`; the user, 2026-11-25: the chart is the current organisation's), so Finish
+  moves it to the new organisation, active again as A3's map does, and no report, bill or daily-closing
+  account is left on the old organisation's. An archived account nothing uses stays out. **Change matches**: `POST .../matching/change` (connected, `XERO_SETTINGS_UPDATE`)
   prefills a pick per account; `POST .../matching/cancel` leaves it, nothing changed; the company stays
   connected and publishing goes on. Finish relinks only what changed (two accounts may swap: the
   changed ones let go of their Xero id first, as `uq_account_entity_xero` isn't deferrable), clears
@@ -593,15 +602,39 @@ The doc "Minty Xero Sync & Report Decisions" (claude.ai artifact HV37p5LpnzconZB
 Merge (route, `merge_accounts`, `combine_accounts`) is gone. Accounts merged before then keep
 `merged_into_id` and their merging-table rows, and every reader still follows them.
 
+**Matching and merging are separate (the user, 2026-11-25):** matching never merges (above: the contacts
+step, Try again, "map it now"); merging is the Settings Merge, or Minty following a merge done in Xero.
+
 - **The one merge (M1-M4), `xero/services/merge.py`.** `combine_contacts` moves every record of the
   merged contact to the kept one (expenses, bills, daily closing's slots; a kept contact's bills take
   its name - `xero/services/bill_text.py`, the user's rule 2026-11-24), archives it with
   `merged_into_id` and writes `minty_merge` plus a `minty_merge_record` per moved row (minty-db v0.14)
-  besides `contact_change_log`. No new record, Xero not touched, no undo. Matching's Finish runs it
-  (`_merge_supplier`; reason `xero_matching`).
-- **Settings Merge (contacts only)**: `POST /api/me/company/contacts/<id>/merge {"into"}`
-  (`hub/company_chart.py`, handled here, not forwarded; `COA_DELETE`) -> `merge_contacts`: same company,
-  both active, the kept one never merged away. 200 `{message, moved}`. `POST .../accounts/<id>/merge` is 404.
+  besides `contact_change_log`. No new record, Xero not touched, no undo.
+- **Settings Merge (contacts only; the user, 2026-11-25)**: `POST /api/me/company/contacts/merge {ids, keep}`
+  (`hub/company_chart.py`, handled here, not forwarded; `COA_DELETE`) -> `merge_contacts`.
+  - Several ticked contacts are absorbed into the one kept: always one of them, never a new contact.
+  - Refused with 400: fewer than two (`TICK_TWO`), or `keep` not among them (`KEEP_TICKED`).
+  - Refused with 404: one that isn't the company's active, unmerged contact.
+  - While Xero is connected (`status = 'connected'`), a ticked contact linked to the organisation is
+    merged in Xero first (409 `MERGE_IN_XERO`, "In Xero already: ... merge them in Xero first, and Minty
+    follows at the next sync."). Contacts only in Minty still merge here.
+  - While Xero is off (disconnected, or never connected), contacts linked to Xero merge here too (the
+    user's pick, 2026-11-25). Xero keeps them as separate contacts, and minty-web says so. The merged
+    one stays archived with its Xero link. A later pick of that Xero contact ("map it now", matching) is
+    refused as merged, not deleted (`TAKEN_BY_MERGED` via `merge.taken_by_archived`).
+  - Each absorbed contact is one `minty_merge` row (reason `user`), one batch. The answer is 200
+    `{message: "A and B merged into C. C stays.", kept, moved}`.
+  - The pairwise `POST .../contacts/<id>/merge` and `POST .../accounts/<id>/merge` are 404.
+- **Minty follows a merge done in Xero at the next sync** (`sync.follow_xero_merges`):
+  - Xero's contact list leaves out archived contacts, and only `GET /Contacts/{id}` names
+    `MergedToContactID`. So each linked, active contact missing from the list is asked for by id,
+    at most `FOLLOW_MERGES_PER_RUN` (25) a run.
+  - One Xero merged is relinked to Xero's kept contact, or merged into the Minty contact that has it
+    (`relink_contact`, `merged_in_xero`).
+  - This runs before the list's new contacts are added, so the kept contact is never a second row
+    first.
+  - One archived with no merge is left for publish (C4). The sync's contact counts carry
+    `followed_merges`.
 - **The sync keeps merged rows**: `apply_accounts` never touches a row with `merged_into_id` (it used to
   delete a merged-away Xero account Xero dropped, and its log with it).
 - **Every overwrite is logged** (the user, 2026-11-24):
@@ -614,9 +647,10 @@ Merge (route, `merge_accounts`, `combine_accounts`) is gone. Accounts merged bef
     code are still not refreshed.
 - **A contact archived in Xero (C4)**: `POST /api/internal/xero/contacts/<id>/relink {xero_contact_id,
   reason}` (assertion scope `xero-contact-relink`; `merge.relink_contact`) - Petty Cash's and Payment
-  Requests' publish follow Xero's merge (`merged_in_xero`, no prompt) and their "map it now" (`user`). The
-  Xero contact already a different Minty contact: the two are merged (the user's rule). A contact the
-  company deleted holding it: 409.
+  Requests' publish follow Xero's merge (`merged_in_xero`, no prompt) and their "map it now" (`user`).
+  The Xero contact already a different Minty contact: following Xero's merge, the two are merged (the
+  user's rule); a person's "map it now" is refused, 409 `CONTACT_TAKEN` (matching never merges, the user
+  2026-11-25). A contact the company deleted holding it: 409.
 - **One account mapped again (A3)**: `GET /api/me/company/xero/matching/account?account=<id>` (the row and
   the Xero accounts of its kind) and `POST {account_id, xero_account_id}` (`XERO_SETTINGS_UPDATE`;
   `matching.read_one` / `map_one`, through `_link`: Xero's code, name and type, the Minty code kept; no
