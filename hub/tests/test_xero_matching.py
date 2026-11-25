@@ -748,6 +748,85 @@ def test_a_new_organisation_leaves_out_an_archived_account_nothing_uses(connecte
     assert "Licences" not in _rows(body) and "Subscriptions" not in _rows(body)
 
 
+def test_a_new_organisation_lets_go_of_an_unused_archived_accounts_old_link(connected, xero, monkeypatch):
+    """The user, 2026-11-25: none of the old organisation's links is left. An archived account Minty made
+    that nothing uses isn't asked, but Finish lets go of its old Xero account and code (logged
+    ``unlinked``), so bringing it back later makes it an account of Minty's to match - never one still
+    on the old organisation."""
+    entity, admin = connected["entity"], connected["admin"]
+    unused = AccountInfo.objects.get(id=connected["unused"].id)
+    assert (unused.xero_account_id, unused.xero_code, unused.code) == ("x-lic", "485", "6999")
+    AccountInfo.objects.filter(id=unused.id).update(status="ARCHIVED", record_status="archived")
+    _to_new_org(connected, xero, monkeypatch)
+    assert _pick_in(connected, "petty", "y-pc", ORG2).status_code == 200
+    resp = call("post", BASE + "/finish", admin, entity.id)
+    assert resp.status_code == 200, resp.content
+    unused.refresh_from_db()
+    assert (unused.xero_account_id, unused.xero_account_link_id, unused.xero_code, unused.code,
+            unused.record_status) == (None, None, None, "6999", "archived")
+    log = AccountChangeLog.objects.get(account_id=unused.id, kind="unlinked")
+    assert (log.xero_guid, log.before_code, log.after_code) == ("x-lic", "485", "6999")
+    assert not AccountInfo.objects.filter(entity_id=entity.id, xero_account_id__startswith="x-").exists(), (
+        "no account left on the old organisation")
+
+
+def _old_org_contact(m, name, guid, *, archived=False, used=False):
+    """A supplier linked to the first organisation's Xero contact ``guid``."""
+    from minty_db.models import Report, ReportExpense
+
+    contact = XeroContactSync.objects.create(entity_id=m["entity"].id, name=name, source="user", xero_contact_id=guid,
+                                             xero_org_id=ORG, record_status="archived" if archived else "active")
+    if used:
+        report = Report.objects.create(entity_id=m["entity"].id, transaction_date="2026-11-18")
+        ReportExpense.objects.create(report_id=report.id, contact_id=contact.id, amount=1)
+    return contact
+
+
+def _contacts_to_new_org(xero):
+    xero.contacts = [{**c, "ContactID": c["ContactID"].replace("c-", "d-")} for c in xero.contacts]
+
+
+def test_a_new_organisation_also_asks_for_an_archived_contact_a_record_uses(connected, xero, monkeypatch):
+    """The user, 2026-11-25: a supplier archived in Minty that a record still uses is in the contacts
+    step too, so no record keeps a contact of the old organisation."""
+    entity, admin = connected["entity"], connected["admin"]
+    abc = _old_org_contact(connected, "ABC Supplies", "c-abc", archived=True, used=True)
+    _contacts_to_new_org(xero)
+    body = _to_new_org(connected, xero, monkeypatch)
+    suppliers = {r["name"]: r for r in body["contacts"]["suppliers"]}
+    assert suppliers["ABC Supplies"]["pick"]["xero_contact_id"] == str(_contact_copy("d-abc", ORG2).id)
+    assert _pick_in(connected, "petty", "y-pc", ORG2).status_code == 200
+    resp = call("post", BASE + "/finish", admin, entity.id)
+    assert resp.status_code == 200, resp.content
+    abc.refresh_from_db()
+    assert (abc.xero_contact_id, abc.xero_org_id, abc.record_status) == ("d-abc", ORG2, "archived"), (
+        "linked to the new organisation; still archived in Minty")
+
+
+def test_a_new_organisation_leaves_out_an_archived_contact_nothing_uses(connected, xero, monkeypatch):
+    _old_org_contact(connected, "ABC Supplies", "c-abc", archived=True)
+    _contacts_to_new_org(xero)
+    body = _to_new_org(connected, xero, monkeypatch)
+    assert "ABC Supplies" not in {r["name"] for r in body["contacts"]["suppliers"]}
+
+
+def test_a_contact_of_the_old_organisation_answered_new_lets_go_of_its_old_link(connected, xero, monkeypatch):
+    """"New in Xero" for a supplier of the old organisation: its old Xero contact is let go at Finish (logged
+    ``unlinked``), so its first publish finds or makes it in the new organisation (C1) - never the old id."""
+    entity, admin = connected["entity"], connected["admin"]
+    wing = _old_org_contact(connected, "Wing Lee Trading", "c-wing", used=True)
+    _contacts_to_new_org(xero)
+    _to_new_org(connected, xero, monkeypatch)
+    assert _answer(connected, {"contact_id": str(wing.id), "new": True}).status_code == 200
+    assert _pick_in(connected, "petty", "y-pc", ORG2).status_code == 200
+    resp = call("post", BASE + "/finish", admin, entity.id)
+    assert resp.status_code == 200, resp.content
+    wing.refresh_from_db()
+    assert (wing.xero_contact_id, wing.xero_org_id) == (None, None)
+    log = ContactChangeLog.objects.get(contact_id=wing.id)
+    assert (log.kind, log.xero_guid, log.xero_org_id) == ("unlinked", "c-wing", ORG)
+
+
 def test_changing_the_matches_leaves_an_archived_account_to_its_own_map(connected):
     """Same organisation: an account Xero archived is mapped one at a time (A3), not in a change."""
     _gone(connected, "rent")

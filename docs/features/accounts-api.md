@@ -543,14 +543,19 @@ pointing at nothing.
   own accounts. `new_org` also covers every archived account (in Xero or in Minty) that a record uses
   (`usage.used_account_ids`; the user, 2026-11-25: the chart is the current organisation's), so Finish
   moves it to the new organisation, active again as A3's map does, and no report, bill or daily-closing
-  account is left on the old organisation's. An archived account nothing uses stays out. **Change matches**: `POST .../matching/change` (connected, `XERO_SETTINGS_UPDATE`)
+  account is left on the old organisation's. An archived account nothing uses stays out; if Minty made it, Finish lets go of its old Xero account
+  and Xero code (`_let_go_of_old_links`, `account_change_log` `unlinked`; its Minty code stays), so one
+  brought back later is Minty's own, to be matched. Unused Xero-made rows are the sync's to delete. **Change matches**: `POST .../matching/change` (connected, `XERO_SETTINGS_UPDATE`)
   prefills a pick per account; `POST .../matching/cancel` leaves it, nothing changed; the company stays
   connected and publishing goes on. Finish relinks only what changed (two accounts may swap: the
   changed ones let go of their Xero id first, as `uq_account_entity_xero` isn't deferrable), clears
   the marker, resets `xero_publish_from` to today for `first`/`new_org` and keeps it for
   `new_accounts`/`change` (a record of when Finish ran, no longer a publish cut-off);
   a change asks no contacts (nothing created in Xero). Suppliers of another organisation are the
-  contacts step's after a new organisation's connect. While a `first`, `new_accounts` or `new_org`
+  contacts step's after a new organisation's connect, archived ones too while a record uses them
+  (`usage.used_contact_ids`; the user, 2026-11-25) - linked to the new organisation, still archived in
+  Minty. One answered "New in Xero" lets go of the old organisation's contact at Finish
+  (`contact_change_log` `unlinked`), so its first publish finds or makes it in the new one (C1). While a `first`, `new_accounts` or `new_org`
   matching is open the sync refreshes only the copies. **While the matches are being changed** (the
   user, 2026-11-24; production: a change left open from 19 Nov kept 58 Xero accounts out of a company
   for days) the sync takes Xero's new accounts in as on any sync (`matching.sync_during_change`, under

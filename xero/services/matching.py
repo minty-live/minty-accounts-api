@@ -159,12 +159,16 @@ def own_accounts(entity_id):
 
 def own_suppliers(entity_id, org=None):
     """The company's suppliers still to link: active, not combined away, with no Xero id - or, given
-    the current organisation, one of another organisation (Phase 3: a new organisation)."""
+    the current organisation, one of another organisation (Phase 3: a new organisation), archived ones
+    included while a record uses them (the user, 2026-11-25: no record keeps the old organisation's)."""
     unlinked = Q(xero_contact_id__isnull=True) | Q(xero_contact_id="")
-    if org:
-        unlinked |= Q(xero_org_id__isnull=False) & ~Q(xero_org_id=str(org))
-    return XeroContactSync.objects.filter(entity_id=entity_id, merged_into__isnull=True).exclude(
-        record_status="archived").filter(unlinked)
+    active = XeroContactSync.objects.filter(entity_id=entity_id, merged_into__isnull=True)
+    if not org:
+        return active.exclude(record_status="archived").filter(unlinked)
+    other_org = Q(xero_org_id__isnull=False) & ~Q(xero_org_id=str(org))
+    archived_in_use = (Q(record_status="archived") & other_org & ~Q(xero_contact_id="")
+                       & Q(xero_contact_id__isnull=False) & Q(id__in=usage.used_contact_ids(entity_id)))
+    return active.filter((~Q(record_status="archived") & (unlinked | other_org)) | archived_in_use)
 
 
 def _active_accounts(entity_id):
@@ -850,6 +854,8 @@ def finish(entity_id, user_id) -> dict:
             AccountInfo.objects.filter(id__in=moving).update(xero_account_id=None, xero_account_link_id=None)
         for account in changing:  # an unchanged match writes and logs nothing
             _link(entity_id, account, copies[drafts[account.id].xero_account_id], batch, user_id)
+        if reason == "new_org":
+            _let_go_of_old_links(entity_id, entity.xero_org_id, in_scope, batch, user_id)
         contacts = _apply_contacts(entity, batch, user_id)
         AccountMatchDraft.objects.filter(entity_id=entity_id).delete()
         done = {"setup_mode": "xero", "xero_matching": None}
@@ -860,6 +866,34 @@ def finish(entity_id, user_id) -> dict:
     logger.info("xero matching: company %s finished: %s linked, contacts %s (batch %s)", entity_id, len(changing),
                 contacts, batch)
     return {"linked": len(changing), "contacts": contacts}
+
+
+def _let_go_of_old_links(entity_id, org, in_scope, batch, user_id) -> None:
+    """A new organisation's Finish (the user, 2026-11-25: no old organisation's link is left): each
+    account Minty made that the matching didn't ask (archived, nothing uses it) lets go of its old Xero
+    account and Xero code - its Minty code stays, so one brought back is Minty's own, to be matched.
+    Xero-made rows are the sync's (it deletes the unused ones)."""
+    current = set(XeroAccount.objects.filter(entity_id=entity_id, xero_org_id=str(org))
+                  .values_list("xero_guid", flat=True))
+    rows = (AccountInfo.objects.filter(entity_id=entity_id, merged_into__isnull=True, source__in=sync.MINTY_MADE,
+                                       xero_account_id__isnull=False)
+            .exclude(xero_account_id="").exclude(id__in=in_scope).exclude(xero_account_id__in=current))
+    for account in list(rows):
+        before = (_shown_code(account), account.name, _minty_type(account))
+        old_guid = account.xero_account_id
+        old_org = (EntityAccountXero.objects.filter(account_id=account.id).values_list("xero_org_id", flat=True)
+                   .first())
+        AccountInfo.objects.filter(id=account.id).update(xero_account_id=None, xero_account_link_id=None,
+                                                         xero_code=None)
+        EntityAccountXero.objects.filter(account_id=account.id).update(xero_account_id=None, xero_org_id=None)
+        account.refresh_from_db()
+        AccountChangeLog.objects.create(
+            entity_id=entity_id, account_id=account.id, batch_id=batch, kind="unlinked",
+            before_code=_log_code(before[0]), before_name=before[1], before_type=before[2],
+            after_code=_log_code(_shown_code(account)), after_name=account.name, after_type=_minty_type(account),
+            xero_org_id=old_org, xero_guid=old_guid, changed_by=user_id)
+        logger.info("xero matching: company %s account %s let go of the old organisation's Xero account %s",
+                    entity_id, account.id, old_guid)
 
 
 def _apply_contacts(entity: Entity, batch, user_id) -> dict:
@@ -882,6 +916,14 @@ def _apply_contacts(entity: Entity, batch, user_id) -> dict:
         draft = by_contact[supplier.id]
         if draft.add_to_xero:
             counts["new"] += 1  # Minty puts it in Xero at its first publish (C1)
+            if supplier.xero_contact_id and supplier.xero_org_id and supplier.xero_org_id != org:
+                # the old organisation's contact is let go, so that publish never names its id
+                XeroContactSync.objects.filter(id=supplier.id).update(xero_contact_id=None, xero_org_id=None,
+                                                                      xero_contact_link_id=None)
+                ContactChangeLog.objects.create(entity_id=entity.id, contact_id=supplier.id, batch_id=batch,
+                                                kind="unlinked", before_name=supplier.name,
+                                                after_name=supplier.name, xero_org_id=supplier.xero_org_id,
+                                                xero_guid=supplier.xero_contact_id, changed_by=user_id)
             continue
         copy = copies[draft.xero_contact_id]
         stored = (XeroContactSync.objects.filter(entity_id=entity.id, xero_contact_id=copy.xero_guid)
