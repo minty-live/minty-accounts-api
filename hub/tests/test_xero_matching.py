@@ -1058,6 +1058,8 @@ def test_a_reconnect_with_a_new_minty_account_shows_every_account_matched_ones_p
     assert resp.status_code == 200, resp.content
     extra.refresh_from_db()
     assert (extra.xero_account_id, extra.code, extra.xero_code) == ("x-meals", "6300", "425")
-    latest = AccountChangeLog.objects.filter(entity_id=entity.id).order_by("-changed_at").first()
+    # the reconnect's batch by its one new link: changed_at is the test transaction's frozen now(),
+    # the same for every batch, so "latest" can't tell them apart
+    latest = AccountChangeLog.objects.get(entity_id=entity.id, account_id=extra.id)
     assert list(AccountChangeLog.objects.filter(batch_id=latest.batch_id).values_list("account_id", flat=True)) == [
         extra.id], "the prefilled matches write nothing"
