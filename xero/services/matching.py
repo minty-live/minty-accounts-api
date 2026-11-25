@@ -9,7 +9,9 @@ accounts and sales methods pointing at nothing.
 **Begin** (``begin``, in the connect's transaction): the organisation is recorded, the company stays
 ``disconnected`` and ``setup_mode`` ``minty``; only the Xero copies (``xero_account`` /
 ``xero_contact``) are filled, and each own account whose code AND type equal a Xero account's is
-picked automatically (``account_match_draft``, ``picked_by`` NULL). Pending while setup_mode is
+picked automatically (``account_match_draft``, ``picked_by`` NULL); every other account starts on
+Minty's closest Xero account by name (``auto_fill``, the user, 2026-11-25), for the person to check.
+Pending while setup_mode is
 ``minty``, an organisation is set and own accounts remain (``accounts_pending``).
 
 **Picks** (``pick``) save at once, so matching can be finished later. **Every account needs its own
@@ -50,6 +52,7 @@ from __future__ import annotations
 
 import difflib
 import logging
+import re
 import uuid
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -276,19 +279,79 @@ def _similar(a: str, b: str) -> float:
     return difflib.SequenceMatcher(None, (a or "").strip().lower(), (b or "").strip().lower()).ratio()
 
 
+#: Words that say nothing about which account it is.
+_FILLER = frozenset({"expense", "and", "the", "of", "fee", "cost", "account", "a", "c"})
+#: Words that name the same account (after the plural is cut), each to one word (the user, 2026-11-25).
+_SYNONYMS = {
+    "wage": "salary", "payroll": "salary",
+    "maintenance": "repair", "fixation": "repair",
+    "advertising": "marketing", "advertisement": "marketing", "promotion": "marketing",
+    "telephone": "phone", "mobile": "phone",
+    "transportation": "transport", "delivery": "transport", "courier": "transport",
+    "rental": "rent",
+    "entertainment": "meal",
+    "travelling": "travel", "traveling": "travel",
+    "employee": "staff",
+    "benefit": "welfare",
+}
+
+
+def _stem(word: str) -> str:
+    if len(word) > 4 and word.endswith("ies"):
+        return word[:-3] + "y"
+    if len(word) > 3 and word.endswith("s") and not word.endswith("ss"):
+        return word[:-1]
+    return word
+
+
+def _key_words(name: str) -> list[str]:
+    """The words that tell an account apart, in order: filler left out, plurals cut, synonyms as one."""
+    words = (_stem(w) for w in re.findall(r"[a-z0-9]+", (name or "").lower()))
+    return list(dict.fromkeys(_SYNONYMS.get(w, w) for w in words if w not in _FILLER))
+
+
+def name_score(a: str, b: str) -> float:
+    """How alike two account names are, 0..1: the better of their words and their letters, both
+    without the filler ("Wages and Salaries" ~ "Salaries - full time"; "Packaging expense" is nearer
+    "Packaging materials" than "Training expense"). A name of filler only is compared as it is."""
+    words_a, words_b = _key_words(a), _key_words(b)
+    if not words_a or not words_b:
+        return _similar(a, b)
+    shared = len(set(words_a) & set(words_b))
+    return max(_similar(" ".join(words_a), " ".join(words_b)), 2 * shared / (len(words_a) + len(words_b)))
+
+
+def _same_number(account: AccountInfo, copy: XeroAccount) -> bool:
+    number = (account.bank_account_number or "").strip()
+    return bool(number) and number == (copy.bank_account_number or "").strip()
+
+
+def _rank(account: AccountInfo, account_type, copy: XeroAccount) -> tuple:
+    """How well ``copy`` fits ``account``, larger first: a bank's own number, then the name, then the
+    same type over the same class, then the letters alone."""
+    return (_same_number(account, copy), name_score(account.name, copy.name), _copy_type(copy) == account_type,
+            _similar(account.name, copy.name))
+
+
 def _suggestion(account: AccountInfo, copies: list[XeroAccount]) -> XeroAccount | None:
-    """A pair Minty suggests (never picks): a bank by its account number, else by name; anything
-    else of the same type with a similar name."""
+    """A pair Minty suggests for a row still empty: a bank by its account number, else a fitting
+    account with a similar name."""
     account_type = _minty_type(account)
-    fitting = [c for c in copies if _fits(account_type, c)]
-    if account_type == "bank" and account.bank_account_number:
-        by_number = [c for c in fitting if (c.bank_account_number or "").strip()
-                     == account.bank_account_number.strip()]
-        if by_number:
-            return by_number[0]
-    same_type = [c for c in fitting if _copy_type(c) == account_type] or fitting
-    scored = sorted(((_similar(account.name, c.name), c) for c in same_type), key=lambda s: -s[0])
-    return scored[0][1] if scored and scored[0][0] >= 0.6 else None
+    best = max((c for c in copies if _fits(account_type, c)), key=lambda c: _rank(account, account_type, c),
+               default=None)
+    if best is None:
+        return None
+    number, score, _same, _letters = _rank(account, account_type, best)
+    return best if number or score >= 0.6 else None
+
+
+def _is_guess(account: AccountInfo, copy: XeroAccount, draft: AccountMatchDraft) -> bool:
+    """A pick Minty made by name (``auto_fill``), for the person to check - not the account's own
+    link, not the same code and type (``auto_pick``), not the person's own pick."""
+    if draft.picked_by is not None or (account.xero_account_id or "") == copy.xero_guid:
+        return False
+    codes = {c for c in ((account.xero_code or "").strip(), (account.code or "").strip()) if c}
+    return not (copy.code in codes and _copy_type(copy) == _minty_type(account))
 
 
 def _prefill_links(entity_id, org, accounts) -> int:
@@ -333,6 +396,37 @@ def auto_pick(entity_id, org, reason="first") -> int:
                 held.add(copy.id)
                 made += 1
                 break
+    return made
+
+
+def auto_fill(entity_id, org, reason="first") -> int:
+    """Every account still empty starts on Minty's best guess (the user, 2026-11-25: matching each by
+    hand took too long; the person checks each and may change it). Best pairs first over the whole
+    chart, so each Xero account goes to the account it fits best and only once (accounts are never
+    merged, and petty cash and the bank stay apart); a Xero account the matching already gives away is
+    never taken. An account nothing in Xero fits stays empty. Runs when a matching opens (``begin``,
+    ``start_change``), never on Refresh, so a row the person emptied stays empty."""
+    drafts = AccountMatchDraft.objects.filter(entity_id=entity_id)
+    picked = set(drafts.values_list("account_id", flat=True))
+    held = set(drafts.values_list("xero_account_id", flat=True))
+    free = [c for c in _copies(entity_id, org) if c.id not in held]
+    pairs = []
+    for account in scope_accounts(entity_id, org, reason):
+        if account.id in picked:
+            continue
+        account_type = _minty_type(account)
+        pairs += [(_rank(account, account_type, c), c.code or "", c.name or "", account, c)
+                  for c in free if _fits(account_type, c)]
+    pairs.sort(key=lambda p: (tuple(-x for x in p[0]), p[1], p[2]))
+    made = 0
+    for _rank_of, _code_of, _name_of, account, copy in pairs:
+        if account.id in picked or copy.id in held:
+            continue
+        AccountMatchDraft.objects.create(account_id=account.id, entity_id=entity_id, xero_account_id=copy.id,
+                                         picked_by=None)
+        picked.add(account.id)
+        held.add(copy.id)
+        made += 1
     return made
 
 
@@ -460,7 +554,7 @@ def read(entity: Entity) -> dict:
     titles = dict(GROUPS)
     unmatched: list = []
     groups = {key: [] for key, _title in GROUPS}
-    matched = 0
+    matched = guessed = 0
     for account in accounts:
         account_type = _minty_type(account)
         draft = drafts.get(account.id)
@@ -480,7 +574,8 @@ def read(entity: Entity) -> dict:
             "group": titles[_group(account_type)],
             "used": account.id in used,
             "system": bool(account.is_system),
-            "pick": {"xero_account_id": str(copy.id), "auto": draft.picked_by is None} if copy else None,
+            "pick": {"xero_account_id": str(copy.id), "auto": draft.picked_by is None,
+                     "guess": _is_guess(account, copy, draft)} if copy else None,
             "suggestion": str(suggestion.id) if suggestion else None,
             "conflict": {"code": conflict.code, "name": conflict.name} if conflict else None,
         }
@@ -488,6 +583,7 @@ def read(entity: Entity) -> dict:
             unmatched.append(row)
         else:
             matched += 1
+            guessed += row["pick"]["guess"]
             groups[_group(account_type)].append(row)
     shown = [{"key": "unmatched", "title": "Not matched yet", "rows": unmatched}] if unmatched else []
     shown += [{"key": key, "title": title, "rows": groups[key]} for key, title in GROUPS if groups[key]]
@@ -500,6 +596,8 @@ def read(entity: Entity) -> dict:
                      "kind": "bank" if _copy_type(c) == "bank" else _class(_copy_type(c)),
                      "held_by": names_of.get(holder.get(c.id))} for c in copies],
         "matched": matched,
+        # picks Minty made by name, for the person to check (``auto_fill``)
+        "guessed": guessed,
         "total": len(accounts),
         "blocking": len(unmatched),
         "contacts": read_contacts(entity),
@@ -534,6 +632,7 @@ def begin(entity_id, access_token, org, reason="first") -> None:
     AccountMatchDraft.objects.filter(entity_id=entity_id).exclude(account_id__in=scope.values("id")).delete()
     Entity.objects.filter(id=entity_id).update(xero_matching=reason, status="disconnected")
     made = _prefill_links(entity_id, org, scope) + auto_pick(entity_id, org, reason)
+    made += auto_fill(entity_id, org, reason)
     _drop_stale_contact_drafts(entity_id, org, reason)
     auto_pick_contacts(entity_id, org, reason)
     logger.info("xero matching: company %s began matching org %s (%s); %s picked automatically", entity_id, org,
@@ -551,6 +650,7 @@ def start_change(entity_id) -> dict:
             raise Refused(NOT_CONNECTED)
         AccountMatchDraft.objects.filter(entity_id=entity_id).delete()
         _prefill_links(entity_id, entity.xero_org_id, _active_accounts(entity_id))
+        auto_fill(entity_id, entity.xero_org_id, "change")
         Entity.objects.filter(id=entity_id).update(xero_matching="change")
         entity.xero_matching = "change"
     logger.info("xero matching: company %s is changing its matches", entity_id)

@@ -1074,7 +1074,8 @@ def test_a_reconnect_to_another_organisation_matches_instead_of_mirroring(shop, 
         kept = AccountInfo.objects.get(id=row.id)
         assert (kept.record_status, kept.xero_account_id) == ("active", row.xero_account_id), row.name
     assert AccountMatchDraft.objects.filter(account_id=linked.id).exists(), "400 = 400, same type: picked"
-    assert not AccountMatchDraft.objects.filter(account_id=gone.id).exists()
+    guess = AccountMatchDraft.objects.get(account_id=gone.id)
+    assert guess.picked_by is None, "no 425 in the new organisation: Minty's guess, for the person to check"
     assert xero.syncs == [], "no sync until Finish"
 
 

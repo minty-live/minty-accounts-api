@@ -453,7 +453,8 @@ pointing at nothing.
 
 - **Connect** (`hub/xero_oauth.py` `_record`): a company with `setup_mode = 'minty'` and its own accounts
   is not mirrored. `matching.begin` fills only the Xero copies (`xero_account` / `xero_contact`) and the
-  automatic picks (same code AND type, `account_match_draft.picked_by` NULL); the organisation is
+  automatic picks (same code AND type, `account_match_draft.picked_by` NULL), then Minty's guesses
+  (below); the organisation is
   recorded, the company stays `disconnected` and `minty`, and the person lands on the hub's
   `/settings/integration/match` (accounts-api's `settings_integration_match` redirect). No background
   sync yet; `_sync_connection` never marks such a company connected (`matching.pending`).
@@ -461,9 +462,21 @@ pointing at nothing.
   `XERO_SETTINGS_UPDATE` otherwise): `GET /api/me/company/xero/matching`. The answer:
   - the accounts still to match first (group `unmatched`, "Not matched yet", in the groups' order, then
     by code), then the matched ones in their groups;
-  - each row with its group, its pick, a suggestion (a bank by its number, else the same type with a
-    similar name, never one another account has), a same-code other-type conflict, and whether a record
-    uses it;
+  - each row with its group, its pick (`guess: true` when Minty filled it in by name), a suggestion for a
+    row still empty (a bank by its number, else a fitting account with a similar name, never one another
+    account has), a same-code other-type conflict, and whether a record uses it;
+  - `guessed`: how many picks are still Minty's guesses (they count as matched and never hold Finish).
+
+  **Minty's guesses (the user, 2026-11-25)** - matching each account by hand took too long:
+  `matching.auto_fill` starts every row still empty on its closest Xero account when a matching opens
+  (`begin`, `start_change`; never on Refresh, so a row the person emptied stays empty). Pairs are ranked
+  over the whole chart - a bank's own account number, then `name_score` (the better of the letters and
+  the words: filler words such as "expense"/"and" left out, plurals cut, synonyms as one word -
+  wages/salaries/payroll, repairs/maintenance, advertising/marketing, telephone/phone,
+  delivery/transport, rent/rental, ...), then the same type over the same class - and taken best first,
+  each Xero account once; only fitting accounts (a bank only to a bank, else the same class). An
+  account nothing in Xero fits stays empty. A guess is `picked_by` NULL with neither the account's own
+  link nor the same code and type; the person's pick (choosing an account, or Keep) replaces it.
   - the Xero accounts to pick from, each with `held_by` (the account that has it);
   - `blocking` (accounts with no pick) and `contacts` (the contacts step, below).
 

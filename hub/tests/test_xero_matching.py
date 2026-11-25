@@ -104,10 +104,9 @@ def own(entity, code, name, xero_type, minty_type, **extra):
                                       account_type=minty_type, status="ACTIVE", source="template", **extra)
 
 
-@pytest.fixture
-def minty(shop, xero):
+def _olive(shop):
     """Olive & Vine keeping its books in Minty: its own chart and daily closing set (Cash Sales
-    included)."""
+    included), connecting Xero - matching begun, every account on Minty's guess."""
     entity = shop["entity"]
     Entity.objects.filter(id=entity.id).update(setup_mode="minty")
     rows = {
@@ -135,6 +134,22 @@ def minty(shop, xero):
                                                connected_by_user_id=shop["admin"].id)
     entity.refresh_from_db()
     return {"entity": entity, "admin": shop["admin"], "cashier": shop["cashier"], **rows}
+
+
+@pytest.fixture
+def guessed(shop, xero):
+    return _olive(shop)
+
+
+@pytest.fixture
+def minty(shop, xero):
+    """As ``guessed``, with Minty's name guesses emptied (the tests below pick by hand); the
+    same-code picks stay."""
+    m = _olive(shop)
+    rows = matching.read(m["entity"])["groups"]
+    AccountMatchDraft.objects.filter(account_id__in=[r["account_id"] for g in rows for r in g["rows"]
+                                                     if r["pick"] and r["pick"]["guess"]]).delete()
+    return m
 
 
 def _copy(guid):
@@ -227,6 +242,85 @@ def test_a_pick_must_fit(minty):
     assert _pick(minty, "bank", "x-bank").status_code == 200
     assert _pick(minty, "bank", None).status_code == 200
     assert not AccountMatchDraft.objects.filter(account_id=minty["bank"].id).exists()
+
+
+# ---- Minty's guesses (the user, 2026-11-25: every dropdown starts filled, the person may change it) ----
+
+
+@pytest.mark.parametrize("minty_name, xero_name, at_least", [
+    ("Telephone and Internet", "Telephone and internet", 1.0),
+    ("Wages and Salaries", "Salaries - full time", 0.5),
+    ("Delivery and Transportation Expense", "Delivery expense", 1.0),
+    ("Marketing & Advertising", "Marketing Expense", 1.0),
+    ("Repairs and Maintenance", "Repair and fixation", 1.0),
+    ("Rent", "Rental expense", 1.0),
+])
+def test_names_are_scored_by_their_words_and_synonyms(minty_name, xero_name, at_least):
+    assert matching.name_score(minty_name, xero_name) >= at_least
+
+
+def test_a_name_never_scores_on_filler_words_alone():
+    assert matching.name_score("Other Expense", "Professional expense - Others") < matching.name_score(
+        "Professional Expense", "Professional expense - Others")
+    assert matching.name_score("Packaging expense", "Training expense") < matching.name_score(
+        "Packaging expense", "Packaging materials")
+
+
+def test_a_connect_fills_every_account_with_its_best_guess(guessed):
+    m = guessed
+    body = call("get", BASE, m["admin"], m["entity"].id).json()
+    rows = _rows(body)
+    assert (body["matched"], body["total"], body["blocking"]) == (9, 9, 0), "every dropdown starts filled"
+    picks = {name: XeroAccount.objects.get(id=r["pick"]["xero_account_id"]).xero_guid for name, r in rows.items()}
+    assert picks["Rent"] == "x-rent" and rows["Rent"]["pick"]["guess"] is False, "same code and type"
+    assert picks["Petty Cash"] == "x-pc" and picks["Bank Account"] == "x-bank", "a bank only to a bank"
+    assert picks["Cleaning Expense"] == "x-clean"
+    assert picks["Online Sales"] == "x-sales" and picks["Amount Due to Director"] == "x-dir"
+    assert {picks["Salaries - Full Time"], picks["Salaries - Part Time"]} == {"x-wages", "x-casual"}
+    assert picks["Licences"] in ("x-lic", "x-print")
+    assert len(set(picks.values())) == 9, "one Xero account each"
+    assert all(r["pick"]["guess"] for name, r in rows.items() if name != "Rent")
+    assert body["guessed"] == 8
+    assert all(d.picked_by is None for d in AccountMatchDraft.objects.filter(entity_id=m["entity"].id))
+
+
+def test_choosing_a_guess_makes_it_the_persons_match(guessed):
+    m = guessed
+    rows = _rows(call("get", BASE, m["admin"], m["entity"].id).json())
+    same = XeroAccount.objects.get(id=rows["Cleaning Expense"]["pick"]["xero_account_id"]).xero_guid
+    body = _pick(m, "clean", same).json()
+    assert _rows(body)["Cleaning Expense"]["pick"]["guess"] is False
+    assert body["guessed"] == 7
+    assert AccountMatchDraft.objects.get(account_id=m["clean"].id).picked_by == m["admin"].id
+
+
+def test_a_guess_never_takes_a_persons_pick_or_its_xero_account(minty):
+    m = minty
+    assert _pick(m, "wages_pt", "x-wages").status_code == 200
+    assert matching.auto_fill(m["entity"].id, ORG, "first") == 7, "every row still empty"
+    draft = AccountMatchDraft.objects.get(account_id=m["wages_pt"].id)
+    assert (draft.xero_account_id, draft.picked_by) == (_copy("x-wages").id, m["admin"].id)
+    assert AccountMatchDraft.objects.get(account_id=m["wages_ft"].id).xero_account_id == _copy("x-casual").id
+    assert matching.auto_fill(m["entity"].id, ORG, "first") == 0, "a filled row is left as it is"
+
+
+def test_a_row_nothing_in_xero_fits_stays_empty(minty):
+    own(minty["entity"], "1500", "Office Equipment", "FIXED", "fixed")
+    matching.auto_fill(minty["entity"].id, ORG, "first")
+    rows = _rows(call("get", BASE, minty["admin"], minty["entity"].id).json())
+    assert rows["Office Equipment"]["pick"] is None, "no asset account in Xero: added there, then Refresh"
+
+
+def test_changing_the_matches_guesses_for_an_account_added_since(connected):
+    entity, admin = connected["entity"], connected["admin"]
+    own(entity, "6100", "Printing and Stationery", "EXPENSE", "expense")
+    body = call("post", BASE + "/change", admin, entity.id).json()
+    rows = _rows(body)
+    pick = rows["Printing and Stationery"]["pick"]
+    assert XeroAccount.objects.get(id=pick["xero_account_id"]).xero_guid == "x-print"
+    assert pick["guess"] is True
+    assert rows["Rent"]["pick"]["guess"] is False, "an account's own link is no guess"
+    assert body["guessed"] == 1
 
 
 # ---- finish -----------------------------------------------------------------------------------------
@@ -1046,10 +1140,13 @@ def test_a_reconnect_with_a_new_minty_account_shows_every_account_matched_ones_p
         matching.begin(entity.id, "tok", ORG, reason=reason)
 
     body = call("get", BASE, admin, entity.id).json()
-    assert body["total"] == 10 and body["matched"] == 9 and body["blocking"] == 1
-    assert body["groups"][0]["key"] == "unmatched"
-    assert [r["name"] for r in body["groups"][0]["rows"]] == ["Staff Meals"]
+    assert body["total"] == 10 and body["matched"] == 10 and body["blocking"] == 0
+    assert "unmatched" not in [g["key"] for g in body["groups"]], "the new account starts on Minty's guess"
+    meals = _rows(body)["Staff Meals"]["pick"]
+    assert (meals["xero_account_id"], meals["guess"]) == (str(_copy("x-meals").id), True)
+    assert body["guessed"] == 1
     assert _rows(body)["Rent"]["pick"]["xero_account_id"] == str(_copy("x-rent").id), "prefilled"
+    assert _rows(body)["Rent"]["pick"]["guess"] is False
     assert body["contacts"]["blocking"] == 0
 
     connected["extra"] = extra
