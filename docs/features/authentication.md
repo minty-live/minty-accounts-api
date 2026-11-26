@@ -50,7 +50,9 @@ site (`hub/session.safe_internal_path`) and drains the flashed messages into a s
 `credentials: "omit"`): open CORS, no CSRF.
 
 1. `POST /auth/email/request-code` - in login mode (`mode: "login"`) an unknown address is
-   refused **before** a code is sent (404 "Please sign up first"), by the same rule verify signs
+   refused **before** a code is sent (404 "You haven't signed up yet. Click Continue to start
+   sign-up." with `action: "signup"`; since 2026-11-26 the sign-in page asks, and Continue opens
+   `/signup` with the address filled in - names, Terms, a new code, then the account), by the same rule verify signs
    in by (`resolve_user_by_email`: `user.email` or `user.xero_email`; a `username` alone does
    not count). A 6-digit code, valid **60 s**, resend cooldown 60 s. Failed tries carry across
    resends (`email_otp.attempts`); at 5 the address is locked for **15 minutes** (429), anchored
@@ -83,9 +85,30 @@ scope `openid profile email offline_access` and `prompt=login`; the state is `au
 only when it is a path on this site. The callback (`/callback`) checks the nonce before anything
 else, exchanges the code, reads the email from the id_token (its signature is not checked: it
 comes straight from Xero's token endpoint over TLS, as in Flask), resolves the person
-(`resolve_user_by_email`) or makes a passwordless one with the Xero name, stores the token bundle
-(`user_token`) and signs them in. A switched-off account is not signed in. **This is identity
-only** - a company's Xero *connection* is a different flow with different scopes (section 7).
+(`resolve_user_by_email`), stores the token bundle (`user_token`) and signs them in. A
+switched-off account is not signed in. **This is identity only** - a company's Xero *connection*
+is a different flow with different scopes (section 7).
+
+**A Xero login nobody holds is asked first (2026-11-26; it used to get an account at once).**
+With no invitation, the callback makes nothing: it hands the grant back
+(`connect.revoke_whole_auth_event`), stores no tokens, parks the address, the id_token's names and
+the kept `next` for **10 minutes** (`email_signin.park_xero_signup`, a pending `django_session`
+row, salt `xero-signup`) and sends the browser to the hub's `/login?xero_signup=<signed key>`.
+The page asks "You haven't signed up yet" (minty-web's `ConfirmDialog`):
+- `POST /auth/xero/signup-details {key}` reads the parked login without using it up
+  (`parked.peek`);
+- Continue turns the page into the sign-up (Xero's names, editable; its address, fixed; the
+  Terms). `POST /auth/xero/signup {key, first_name, last_name, terms_accepted, terms_version}`
+  checks the names and the Terms first (a refusal keeps the key), then uses the key up
+  (`parked.redeem`) and makes the approved, passwordless account with `email` = `xero_email` =
+  the Xero address and consent source `signup_xero`. **No code:** Xero proved the address. It
+  answers the same single-use hand-off as section 2.1. The next Xero login stores the tokens;
+- Cancel: `POST /auth/xero/signup-cancel {key}` drops the parked login (200 even when it has
+  already gone).
+
+A missing, forged, used or expired key is 410 "That Xero sign-in has timed out. Log in with Xero
+again to continue." An invitee new to Minty is still made an account at the callback (section
+2.3): the invitation is the yes.
 
 ### 2.3 Invitation
 `hub/invitations.py`: someone sends an invite from the company's Users tab (minty-web;

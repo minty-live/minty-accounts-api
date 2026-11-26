@@ -3,8 +3,9 @@
 
 1. ``POST /auth/email/request-code`` ``{email, mode?, invite?}``: a 6-digit code, valid 60 s, with a
    60 s resend cooldown. Failed tries carry across resends; at 5 the address is locked for 15
-   minutes. In login mode an unknown address is refused (404) before a code goes out. A code whose
-   email fails to send is rolled back (400) so the person can retry at once.
+   minutes. In login mode an unknown address is refused (404, ``action: "signup"``: the page asks
+   and Continue opens the sign-up) before a code goes out. A code whose email fails to send is
+   rolled back (400) so the person can retry at once.
 2. ``POST /auth/email/verify-code`` ``{email, code, invite?, first_name?, last_name?, next?,
    terms_accepted?, terms_version?}``: signs an existing person in, or makes the account for a new
    address that came with a name (with its Terms agreement in the same transaction). The answer
@@ -13,6 +14,10 @@
    **Single use (gap 1, 2026-11-06):** the verify step parks the hand-off as a pending session row
    (5 minutes) and the URL carries its key, signed; the landing deletes that row and signs in only
    when the delete removed it - a replay, a second tab or a copied link finds nothing.
+4. ``POST /auth/xero/signup-details|signup|signup-cancel`` ``{key, ...}`` (2026-11-26): a Xero
+   login nobody holds makes nothing at the callback; it is parked for 10 minutes and the sign-in
+   page asks first. Continue -> the sign-up form (names, Terms) -> the account, with no code (Xero
+   proved the address) -> the hand-off above. Cancel drops it.
 
 The routes are cross-origin JSON with no cookie (the sign-in page sends ``credentials: "omit"``):
 open CORS, no CSRF, as in Flask. Codes are stored as werkzeug's ``pbkdf2:sha256`` hashes, so a code
@@ -55,7 +60,14 @@ HANDOFF_SALT = "auth-email-handoff"
 HANDOFF_MAX_AGE = 5 * 60
 SOURCE_SIGNUP_OTP = "signup_otp"
 SOURCE_SIGNUP_INVITE = "signup_invite"
+SOURCE_SIGNUP_XERO = "signup_xero"
 PBKDF2_ITERATIONS = 600_000
+NOT_SIGNED_UP = "You haven't signed up yet. Click Continue to start sign-up."
+XERO_SIGNUP_SALT = "xero-signup"
+XERO_SIGNUP_MAX_AGE = 10 * 60
+XERO_SIGNUP_GONE = "That Xero sign-in has timed out. Log in with Xero again to continue."
+FIRST_NAME_EMPTY = "The first name is still empty. Add your first name to continue."
+LAST_NAME_EMPTY = "The last name is still empty. Add your last name to continue."
 
 
 # ---- codes --------------------------------------------------------------------------------------
@@ -250,7 +262,8 @@ def email_request_code(request: HttpRequest) -> HttpResponse:
     if not is_ascii_email(email):
         return _error(request, EMAIL_ASCII_MESSAGE, 400)
     if data.get("mode") == "login" and ("@" not in email or resolve_user_by_email(email) is None):
-        return _error(request, "Please sign up first", 404)
+        # The page asks (Continue opens the sign-up with this address); nothing is sent.
+        return _answer(request, {"status": "error", "message": NOT_SIGNED_UP, "action": "signup"}, 404)
     if (invite := _text(data, "invite")) and (problem := invitations.invite_error_for_email(invite, email)):
         return _error(request, problem, 400)
     ok, error = request_email_otp(email)
@@ -278,8 +291,9 @@ def _terms_for_signup(data: dict) -> tuple[str | None, str | None]:
 
 
 def _create_passwordless_user(request: HttpRequest, email: str, first_name: str, last_name: str,
-                              source: str | None, version: str | None) -> User | None:
-    """A new approved, passwordless account (its Terms agreement in the same transaction)."""
+                              source: str | None, version: str | None, *, xero: bool = False) -> User | None:
+    """A new approved, passwordless account (its Terms agreement in the same transaction).
+    ``xero``: the address came from a Xero login, so it is the account's ``xero_email`` too."""
     try:
         with transaction.atomic():
             existing = resolve_user_by_email(email) or User.objects.filter(username=email).first()
@@ -287,7 +301,8 @@ def _create_passwordless_user(request: HttpRequest, email: str, first_name: str,
                 return existing
             user = User.objects.create(id=uuid.uuid4(), email=email, username=email, first_name=first_name,
                                        last_name=last_name, password=hash_code(secrets.token_urlsafe(32)),
-                                       system_role="normal", approved=True)
+                                       system_role="normal", approved=True,
+                                       **({"xero_email": email} if xero else {}))
             if source and not record_consent(request, user.id, version, source=source):
                 raise RuntimeError("the Terms agreement could not be recorded")
     except Exception as exc:  # noqa: BLE001 - answered as a refusal, logged
@@ -343,6 +358,70 @@ def email_verify_code(request: HttpRequest) -> HttpResponse:
         return _error(request, "Could not create your account. Please try again.", 400)
     url = mint_handoff_url(request, new.id, next_path=next_path)
     return _answer(request, {"status": "success", "action": "login", "redirect_url": url})
+
+
+# ---- a Xero login nobody holds: asked first, then signed up (2026-11-26) -------------------------
+
+
+def park_xero_signup(email: str, first_name: str, last_name: str, next_path: str) -> str:
+    """What the Xero callback knows of a login nobody holds, held for its sign-up; the signed key."""
+    return parked.park({"email": email, "first_name": first_name, "last_name": last_name, "next": next_path},
+                       salt=XERO_SIGNUP_SALT, max_age=XERO_SIGNUP_MAX_AGE)
+
+
+def _xero_signup(key: str, *, use: bool) -> dict | None:
+    if not key:
+        return None
+    read = parked.redeem if use else parked.peek
+    data = read(key, salt=XERO_SIGNUP_SALT, max_age=XERO_SIGNUP_MAX_AGE, what="Xero sign-up")
+    return data if data and data.get("email") else None
+
+
+def xero_signup_details(request: HttpRequest) -> HttpResponse:
+    """``{key}`` -> the Xero login's address and names, for the pop-up and the form (not used up)."""
+    if (early := _post_only(request)) is not None:
+        return early
+    held = _xero_signup(_text(_body(request), "key"), use=False)
+    if held is None:
+        return _error(request, XERO_SIGNUP_GONE, 410)
+    return _answer(request, {"status": "success", "email": held["email"],
+                             "first_name": held.get("first_name") or "", "last_name": held.get("last_name") or ""})
+
+
+def xero_signup(request: HttpRequest) -> HttpResponse:
+    """``{key, first_name, last_name, terms_accepted, terms_version}``: the account for the Xero
+    login (no code: Xero proved the address), then the same hand-off as a code sign-in. A refusal
+    leaves the key for another try; the key is used up only once everything checks out."""
+    if (early := _post_only(request)) is not None:
+        return early
+    data = _body(request)
+    key, first_name, last_name = _text(data, "key"), _text(data, "first_name"), _text(data, "last_name")
+    if _xero_signup(key, use=False) is None:
+        return _error(request, XERO_SIGNUP_GONE, 410)
+    if not first_name:
+        return _error(request, FIRST_NAME_EMPTY, 400)
+    if not last_name:
+        return _error(request, LAST_NAME_EMPTY, 400)
+    version, refusal = _terms_for_signup(data)
+    if refusal:
+        return _error(request, refusal, 400)
+    held = _xero_signup(key, use=True)  # the single use: a second tab finds nothing
+    if held is None:
+        return _error(request, XERO_SIGNUP_GONE, 410)
+    new = _create_passwordless_user(request, held["email"], first_name, last_name,
+                                    SOURCE_SIGNUP_XERO if version else None, version, xero=True)
+    if new is None:
+        return _error(request, "Could not create your account. Please try again.", 400)
+    url = mint_handoff_url(request, new.id, next_path=safe_internal_path(held.get("next")) or "")
+    return _answer(request, {"status": "success", "action": "login", "redirect_url": url})
+
+
+def xero_signup_cancel(request: HttpRequest) -> HttpResponse:
+    """``{key}``: Cancel on the pop-up - the held login is dropped (already gone is fine)."""
+    if (early := _post_only(request)) is not None:
+        return early
+    _xero_signup(_text(_body(request), "key"), use=True)
+    return _answer(request, {"status": "success"})
 
 
 def email_handoff(request: HttpRequest) -> HttpResponse:

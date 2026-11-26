@@ -402,15 +402,109 @@ def test_a_stale_flash_is_drained_and_next_after_login_kept(shop, xero):
     assert flashes(client) == [("success", "You're signed in with Xero.")]
 
 
-def test_a_xero_login_nobody_holds_gets_an_account(db, xero):
+HUB = "http://localhost:3000"
+LIVE = registry.current_version(registry.TERMS)
+
+
+def xero_signup_key(client: Client, xero, **start) -> str:
+    """A Xero login nobody holds: the callback's answer is the sign-in page asking about sign-up."""
+    resp = callback(client, state_of(client.get("/xero_auth", start)))
+    parts = urlsplit(resp["Location"])
+    assert f"{parts.scheme}://{parts.netloc}{parts.path}" == HUB + "/login", resp["Location"]
+    query = parse_qs(parts.query)
+    assert set(query) == {"xero_signup"}, query  # no address, no name: only the signed key
+    return query["xero_signup"][0]
+
+
+def post_json(client: Client, path: str, body: dict):
+    return client.post(path, body, content_type="application/json")
+
+
+def test_a_xero_login_nobody_holds_makes_nothing_and_asks_first(db, xero):
     xero.email, xero.claims = "New.Person@Test.com", {"given_name": "Nia", "family_name": "New"}
     client = Client()
-    callback(client, state_of(client.get("/xero_auth")))
+    key = xero_signup_key(client, xero)
+    assert User.objects.count() == 0 and "user_id" not in client.session
+    assert UserToken.objects.count() == 0  # nothing of the grant is kept
+    assert xero.deleted == [f"{connect.CONNECTIONS_URL}/conn-1"]  # and what it granted is handed back
+    details = post_json(Client(), "/auth/xero/signup-details", {"key": key})
+    assert (details.status_code, details.json()) == (200, {
+        "status": "success", "email": "new.person@test.com", "first_name": "Nia", "last_name": "New"})
+    # Reading the details does not use the key up.
+    assert post_json(Client(), "/auth/xero/signup-details", {"key": key}).status_code == 200
+
+
+def test_xero_sign_up_makes_the_account_records_the_terms_and_signs_in(db, xero):
+    xero.email, xero.claims = "new.person@test.com", {"given_name": "Nia", "family_name": "New"}
+    client = Client()
+    key = xero_signup_key(client, xero, next="/entity/abc/dashboard")
+    made = post_json(Client(), "/auth/xero/signup", {"key": key, "first_name": "Nia", "last_name": "Newer",
+                                                      "terms_accepted": True, "terms_version": LIVE})
+    assert made.status_code == 200, made.json()
     person = User.objects.get(email="new.person@test.com")
     assert (person.first_name, person.last_name, person.xero_email, person.username) == (
-        "Nia", "New", "new.person@test.com", "new.person@test.com")
-    assert person.approved and client.session["user_id"] == str(person.id)
-    assert person.password.startswith("pbkdf2:sha256:")
+        "Nia", "Newer", "new.person@test.com", "new.person@test.com")
+    assert person.approved and person.password.startswith("pbkdf2:sha256:")
+    assert TermsConsent.objects.filter(user_id=person.id, terms_version=LIVE, source="signup_xero").exists()
+    landing = urlsplit(made.json()["redirect_url"])
+    resp = client.get(f"{landing.path}?{landing.query}")
+    assert resp["Location"] == "/entity/abc/dashboard" and client.session["user_id"] == str(person.id)
+    # Once only.
+    again = post_json(Client(), "/auth/xero/signup", {"key": key, "first_name": "Nia", "last_name": "New",
+                                                       "terms_accepted": True, "terms_version": LIVE})
+    assert again.status_code == 410 and User.objects.count() == 1
+
+
+@pytest.mark.parametrize("body, sentence", [
+    ({"first_name": "", "last_name": "New", "terms_accepted": True},
+     "The first name is still empty. Add your first name to continue."),
+    ({"first_name": "Nia", "last_name": " ", "terms_accepted": True},
+     "The last name is still empty. Add your last name to continue."),
+    ({"first_name": "Nia", "last_name": "New", "terms_accepted": False},
+     "You must accept the Terms of Use to create an account."),
+])
+def test_a_refused_xero_sign_up_makes_nobody_and_keeps_the_key(db, xero, monkeypatch, body, sentence):
+    monkeypatch.setattr(registry, "REQUIRE_TERMS_AT_SIGNUP", True)
+    xero.email = "new.person@test.com"
+    key = xero_signup_key(Client(), xero)
+    resp = post_json(Client(), "/auth/xero/signup", {"key": key, "terms_version": LIVE, **body})
+    assert (resp.status_code, resp.json()["message"]) == (400, sentence)
+    assert User.objects.count() == 0
+    assert post_json(Client(), "/auth/xero/signup-details", {"key": key}).status_code == 200
+
+
+@pytest.mark.parametrize("key", ["", "forged", "x" * 80])
+def test_a_bad_xero_sign_up_key_is_refused(db, key):
+    for path in ("/auth/xero/signup-details", "/auth/xero/signup"):
+        resp = post_json(Client(), path, {"key": key, "first_name": "A", "last_name": "B", "terms_accepted": True,
+                                          "terms_version": LIVE})
+        assert (resp.status_code, resp.json()["message"]) == (
+            410, "That Xero sign-in has timed out. Log in with Xero again to continue.")
+    assert User.objects.count() == 0
+
+
+def test_an_expired_xero_sign_up_key_is_refused(db, xero, monkeypatch):
+    xero.email = "new.person@test.com"
+    key = xero_signup_key(Client(), xero)
+    from hub import email_signin
+    monkeypatch.setattr(email_signin, "XERO_SIGNUP_MAX_AGE", -1)
+    assert post_json(Client(), "/auth/xero/signup-details", {"key": key}).status_code == 410
+
+
+def test_cancelling_a_xero_sign_up_drops_the_key(db, xero):
+    xero.email = "new.person@test.com"
+    key = xero_signup_key(Client(), xero)
+    assert post_json(Client(), "/auth/xero/signup-cancel", {"key": key}).status_code == 200
+    assert post_json(Client(), "/auth/xero/signup-details", {"key": key}).status_code == 410
+    assert post_json(Client(), "/auth/xero/signup-cancel", {"key": key}).status_code == 200  # already gone: fine
+    assert User.objects.count() == 0
+
+
+def test_the_xero_sign_up_routes_are_post_only_and_open_to_any_origin(db):
+    for path in ("/auth/xero/signup-details", "/auth/xero/signup", "/auth/xero/signup-cancel"):
+        assert Client().get(path).status_code == 405
+        pre = Client().options(path, HTTP_ORIGIN="https://my.dailyminty.com")
+        assert pre.status_code == 200
 
 
 def test_a_xero_login_without_an_email_is_refused(db, xero):

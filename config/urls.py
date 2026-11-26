@@ -105,6 +105,9 @@ urlpatterns = [
     path("auth/email/request-code", email_signin.email_request_code, name="email_request_code"),
     path("auth/email/verify-code", email_signin.email_verify_code, name="email_verify_code"),
     path("auth/email/handoff", email_signin.email_handoff, name="email_handoff"),
+    path("auth/xero/signup-details", email_signin.xero_signup_details, name="xero_signup_details"),
+    path("auth/xero/signup", email_signin.xero_signup, name="xero_signup"),
+    path("auth/xero/signup-cancel", email_signin.xero_signup_cancel, name="xero_signup_cancel"),
     path("invitation/accept/<str:token>", front_door.invitation_accept_page, name="invitation_accept"),
     # Phase 6D: Xero OAuth - sign in with Xero, connect and reconnect a company (state nonce).
     path("xero_auth", xero_oauth.xero_auth, name="xero_auth"),

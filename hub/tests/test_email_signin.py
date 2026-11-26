@@ -120,8 +120,24 @@ def test_login_mode_sends_a_code_to_either_identity_and_refuses_an_unknown_addre
     User.objects.filter(id=person.id).update(**{column: "Owner@Test.com"})
     assert ask(Client(), "owner@test.com", mode="login").status_code == 200
     resp = ask(Client(), "stranger@test.com", mode="login")
-    assert (resp.status_code, resp.json()["message"]) == (404, "Please sign up first")
+    assert (resp.status_code, resp.json()) == (404, {
+        "status": "error", "message": "You haven't signed up yet. Click Continue to start sign-up.",
+        "action": "signup"})
+    assert not EmailOtp.objects.filter(email="stranger@test.com").exists()  # nothing sent
     assert ask(Client(), "stranger@test.com").status_code == 200  # sign-up mode is open
+
+
+def test_continue_after_the_refusal_is_the_sign_up_by_code(db):
+    """The page's Continue opens the sign-up: names, Terms, a new code, then the account."""
+    client = Client()
+    assert ask(client, "stranger@test.com", mode="login").status_code == 404
+    assert ask(client, "stranger@test.com").status_code == 200
+    verified = verify(client, "stranger@test.com", first_name="Sam", last_name="Stranger",
+                      terms_accepted=True, terms_version=LIVE)
+    assert verified.status_code == 200, verified.json()
+    person = User.objects.get(email="stranger@test.com")
+    assert (person.first_name, person.last_name) == ("Sam", "Stranger")
+    assert TermsConsent.objects.filter(user_id=person.id, terms_version=LIVE, source="signup_otp").exists()
 
 
 def test_a_username_alone_does_not_open_login_mode(db):

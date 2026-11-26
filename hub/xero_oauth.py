@@ -44,7 +44,7 @@ from minty_shared import logctx
 from core.flask_json import flask_json
 from hub.addresses import company_path
 from hub.company import _sync_connection, held_elsewhere_sentence
-from hub.email_signin import hash_code, resolve_user_by_email
+from hub.email_signin import hash_code, park_xero_signup, resolve_user_by_email
 from hub.front_door import signed_in_or_door
 from hub.invitations import accept_invitation
 from hub.links import handoff_origin, hub_login_url
@@ -505,17 +505,21 @@ def _sign_in_with_xero(request: HttpRequest, code, invite_token: str) -> HttpRes
                            "inviter know?", "danger")
             return _to_sign_in()
 
-    # No "sign up first": a Xero login nobody holds gets an account.
+    # A Xero login nobody holds makes nothing here (2026-11-26): the sign-in page asks first, and
+    # Continue opens the sign-up (names, Terms) that makes the account. The grant is handed back.
     if not user:
         if not xero_email:
             logger.warning("Xero login: id_token carried no email claim")
             flash(request, NO_EMAIL, "danger")
             return _to_sign_in()
-        user = _create_user_from_xero(grant.id_claims, xero_email)
-        if user is None:
-            flash(request, "I couldn't get you in just now. Mind trying again?", "danger")
-            return _to_sign_in()
-        logger.info("Xero login: auto-created account for %s", xero_email)
+        connect.revoke_whole_auth_event(grant.access_token)
+        claims = grant.id_claims or {}
+        key = park_xero_signup(xero_email, (claims.get("given_name") or "").strip(),
+                               (claims.get("family_name") or "").strip(),
+                               safe_internal_path(request.session.pop("next_after_login", None)) or "")
+        drain_flashes(request)
+        logger.info("Xero login: no Minty account for this login; asking about sign-up")
+        return HttpResponseRedirect(hub_login_url(request, carry_flashes=False, xero_signup=key))
 
     if not user.xero_email:
         User.objects.filter(id=user.id).update(xero_email=xero_email)
