@@ -20,6 +20,7 @@ from zoneinfo import ZoneInfo
 import pytest
 import requests
 from django.db import transaction
+from django.utils import timezone
 from minty_db.models import (
     AccountChangeLog,
     AccountInfo,
@@ -1160,3 +1161,89 @@ def test_a_reconnect_with_a_new_minty_account_shows_every_account_matched_ones_p
     latest = AccountChangeLog.objects.get(entity_id=entity.id, account_id=extra.id)
     assert list(AccountChangeLog.objects.filter(batch_id=latest.batch_id).values_list("account_id", flat=True)) == [
         extra.id], "the prefilled matches write nothing"
+
+
+# ---- changed while Xero was off: the reconnect matches them again (the user, 2026-11-27) -----------------
+
+
+def _reconnect(connected, xero):
+    """Disconnect (the organisation kept), then the connect's ``needs_matching`` + ``begin``."""
+    entity = connected["entity"]
+    Entity.objects.filter(id=entity.id).update(status="disconnected")
+    entity.refresh_from_db()
+    reason = matching.needs_matching(entity, ORG)
+    if reason:
+        with transaction.atomic():
+            matching.begin(entity.id, "tok", ORG, reason=reason)
+    return reason
+
+
+def test_a_reconnect_with_nothing_changed_offline_needs_no_matching(connected, xero):
+    assert _reconnect(connected, xero) is None
+
+
+def test_a_linked_account_changed_offline_opens_the_matching_on_its_own_xero_account(connected, xero):
+    """A disconnected company is Minty-only (the user, 2026-11-27): an account linked to Xero edited
+    with Xero off is marked (``minty_changed_at``), so the reconnect asks about it - on its own Xero
+    account, said so on its row - and Finish clears the mark; the sync then brings Xero's details."""
+    entity, admin = connected["entity"], connected["admin"]
+    rent = AccountInfo.objects.get(entity_id=entity.id, xero_account_id="x-rent")
+    AccountInfo.objects.filter(id=rent.id).update(name="Rent HK", minty_changed_at=timezone.now())
+    assert _reconnect(connected, xero) == "new_accounts"
+
+    body = call("get", BASE, admin, entity.id).json()
+    rows = _rows(body)
+    assert rows["Rent HK"]["pick"]["xero_account_id"] == str(_copy("x-rent").id), "starts on its own"
+    assert rows["Rent HK"]["changed_offline"] is True
+    assert rows["Petty Cash"]["changed_offline"] is False
+    assert body["blocking"] == 0
+
+    resp = call("post", BASE + "/finish", admin, entity.id)
+    assert resp.status_code == 200, resp.content
+    rent.refresh_from_db()
+    assert (rent.xero_account_id, rent.minty_changed_at) == ("x-rent", None)
+    assert not AccountInfo.objects.filter(entity_id=entity.id, minty_changed_at__isnull=False).exists()
+
+
+def test_a_linked_contact_changed_offline_is_asked_on_its_own_xero_contact(connected, xero):
+    entity, admin = connected["entity"], connected["admin"]
+    abc = XeroContactSync.objects.create(entity_id=entity.id, name="ABC Supplies Ltd", source="xero",
+                                         xero_contact_id="c-abc", xero_org_id=ORG,
+                                         xero_contact_link_id=_contact_copy("c-abc").id,
+                                         minty_changed_at=timezone.now())
+    assert _reconnect(connected, xero) == "new_accounts", "a contact alone opens the matching"
+
+    contacts = call("get", BASE, admin, entity.id).json()["contacts"]
+    suppliers = {r["name"]: r for r in contacts["suppliers"]}
+    assert suppliers["ABC Supplies Ltd"]["pick"] == {"xero_contact_id": str(_contact_copy("c-abc").id),
+                                                     "auto": True, "new": False}
+    assert suppliers["ABC Supplies Ltd"]["changed_offline"] is True
+    held = {o["name"]: o["held_by"] for o in contacts["options"]}
+    assert held["ABC Supplies"] == "ABC Supplies Ltd", "its own pick, not a contact outside the step"
+    assert contacts["blocking"] == 0
+
+    before = ContactChangeLog.objects.filter(entity_id=entity.id).count()
+    resp = call("post", BASE + "/finish", admin, entity.id)
+    assert resp.status_code == 200, resp.content
+    abc.refresh_from_db()
+    assert (abc.xero_contact_id, abc.minty_changed_at) == ("c-abc", None)
+    assert ContactChangeLog.objects.filter(entity_id=entity.id).count() == before, "a kept link writes nothing"
+
+
+def test_a_linked_contact_changed_offline_may_go_to_xero_as_a_new_one(connected, xero):
+    entity, admin = connected["entity"], connected["admin"]
+    abc = XeroContactSync.objects.create(entity_id=entity.id, name="ABC Trading", source="xero",
+                                         xero_contact_id="c-abc", xero_org_id=ORG, minty_changed_at=timezone.now())
+    _reconnect(connected, xero)
+    assert _answer(connected, {"contact_id": str(abc.id), "new": True}).status_code == 200
+    assert call("post", BASE + "/finish", admin, entity.id).status_code == 200
+    abc.refresh_from_db()
+    assert (abc.xero_contact_id, abc.xero_org_id) == (None, None), "Minty puts it in Xero at its first publish"
+    assert ContactChangeLog.objects.filter(contact_id=abc.id).values_list("kind", flat=True).get() == "unlinked"
+
+
+def test_an_unlinked_contact_added_offline_opens_the_matching(connected, xero):
+    entity = connected["entity"]
+    XeroContactSync.objects.create(entity_id=entity.id, name="Wing Lee Trading", source="user",
+                                   minty_changed_at=timezone.now())
+    assert _reconnect(connected, xero) == "new_accounts"

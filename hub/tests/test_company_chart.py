@@ -160,3 +160,50 @@ def test_xero_failing_still_shows_the_stored_contacts_and_is_logged(shop, onboar
     resp = call("get", CONTACTS, shop["cashier"], entity.id)
     assert (resp.status_code, resp.json()) == (200, {"contacts": [{"name": "Kee Wah"}]})
     assert "the Xero read for company" in caplog.text
+
+
+@pytest.mark.django_db
+def test_a_rename_in_settings_relabels_the_bills_on_it(shop, onboarding):
+    """Records keep the id and show the name as it is now - their text copies too (the user,
+    2026-11-27): an account or contact renamed in Settings rewrites the bill text on it
+    (``bill_text``), as matching, merges and Xero renames do. A refused edit rewrites nothing."""
+    from minty_db.models import AccountInfo, Bill, BillLine, XeroContactSync
+
+    entity = shop["entity"]
+    rent = AccountInfo.objects.create(entity_id=entity.id, name="Rent", code="469", xero_code="469", type="EXPENSE",
+                                      account_type="expense", status="ACTIVE", source="user")
+    kee = XeroContactSync.objects.create(entity_id=entity.id, name="Kee Wah", source="user")
+    bill = Bill.objects.create(entity_id=entity.id, reference="B-1", contact_id=kee.id, contact_name="Kee Wah",
+                               xero_account_code="469")
+    line = BillLine.objects.create(bill=bill, account_id=rent.id, account_code="469", account_name="Rent")
+
+    onboarding.answer = (409, {"error": "That code is already taken."})
+    AccountInfo.objects.filter(id=rent.id).update(name="Office Rent")  # as if saved, but refused: no rewrite
+    assert call("patch", f"{ACCOUNTS}/{rent.id}", shop["accountant"], entity.id, {"name": "x"}).status_code == 409
+    assert BillLine.objects.get(id=line.id).account_name == "Rent"
+
+    onboarding.answer = (200, {"message": "Office Rent saved."})  # onboarding-api saved the new name
+    assert call("patch", f"{ACCOUNTS}/{rent.id}", shop["accountant"], entity.id, {"name": "x"}).status_code == 200
+    assert BillLine.objects.get(id=line.id).account_name == "Office Rent"
+
+    XeroContactSync.objects.filter(id=kee.id).update(name="Kee Wah Bakery")
+    onboarding.answer = (200, {"message": "Kee Wah Bakery saved."})
+    assert call("patch", f"{CONTACTS}/{kee.id}", shop["accountant"], entity.id, {"name": "x"}).status_code == 200
+    assert Bill.objects.get(id=bill.id).contact_name == "Kee Wah Bakery"
+
+
+def test_archive_and_restore_are_forwarded_with_their_own_rights(shop, onboarding):
+    """Archive takes a row off the pickers - the delete right; restore brings one back - the add
+    right (the user, 2026-11-27). Both are onboarding-api's; the hub opens the door."""
+    entity, row = shop["entity"].id, uuid.uuid4()
+    onboarding.answer = (200, {"message": "Rent archived."})
+    for kind in ("accounts", "contacts"):
+        for action in ("archive", "restore"):
+            path = f"/api/me/company/{kind}/{row}/{action}"
+            refused = call("post", path, shop["manager"], entity, {})
+            assert refused.status_code == 403, (path, refused.content)
+            done = call("post", path, shop["accountant"], entity, {})
+            assert done.status_code == 200, (path, done.content)
+            assert onboarding.asked[-1][:2] == ("POST", f"{kind}/{row}/{action}")
+    assert call("get", f"{ACCOUNTS}/{row}/archive", shop["accountant"], entity).status_code == 405
+    assert call("post", f"{ACCOUNTS}/not-an-id/archive", shop["accountant"], entity, {}).status_code == 404

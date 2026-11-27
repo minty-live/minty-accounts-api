@@ -183,6 +183,36 @@ def test_an_inactive_row_is_re_activated_and_the_petty_cash_tick_is_kept(company
     assert EntityAccountXero.objects.get(xero_account_id="a-1").is_active is False  # the person's tick
 
 
+def test_an_account_archived_in_minty_while_xero_was_off_comes_back_with_its_rows(company, xero):
+    """The user, 2026-11-27: a connected company's chart is Xero's, so an account the company archived
+    while disconnected (Minty's mark: record_status archived, Xero's status still ACTIVE) comes back
+    at the sync while Xero has it - in the pickers again."""
+    xero.accounts = [acct("a-1", "429", "General")]
+    _run(company)
+    AccountInfo.objects.filter(xero_account_id="a-1").update(record_status="archived")
+    EntityAccountXero.objects.filter(xero_account_id="a-1").update(is_active=False)
+    EntityBillAccountXero.objects.filter(entity_id=company.id, xero_account_id="a-1").update(is_active=False)
+
+    assert _run(company)["accounts"]["activated"] == 1
+    assert _accounts(company)["a-1"].record_status == "active"
+    assert EntityAccountXero.objects.get(xero_account_id="a-1").is_active is True
+    assert EntityBillAccountXero.objects.get(entity_id=company.id, xero_account_id="a-1").is_active is True
+
+
+def test_a_contact_archived_in_minty_comes_back_while_xero_has_it_a_merged_one_never(company, xero):
+    kee = XeroContactSync.objects.create(entity_id=company.id, xero_contact_id="c-kee", xero_org_id=TENANT,
+                                         name="Kee Wah", record_status="archived")
+    keep = XeroContactSync.objects.create(entity_id=company.id, xero_contact_id="c-sam", xero_org_id=TENANT,
+                                          name="Sam's Fish")
+    old = XeroContactSync.objects.create(entity_id=company.id, xero_contact_id="c-old", xero_org_id=TENANT,
+                                         name="Sams Fish", record_status="archived", merged_into_id=keep.id)
+    xero.contact_pages = [[{"ContactID": "c-kee", "Name": "Kee Wah"}, {"ContactID": "c-sam", "Name": "Sam's Fish"},
+                           {"ContactID": "c-old", "Name": "Sams Fish"}]]
+    _run(company)
+    assert XeroContactSync.objects.get(id=kee.id).record_status == "active"
+    assert XeroContactSync.objects.get(id=old.id).record_status == "archived", "the record of its merge"
+
+
 @pytest.mark.parametrize("answer", [None, []])
 def test_a_failed_or_empty_account_fetch_changes_nothing(company, xero, answer):
     AccountInfo.objects.create(entity_id=company.id, xero_account_id="a-1", xero_code="429", name="General",
@@ -200,7 +230,8 @@ def test_contacts_are_added_and_renamed_never_removed(company, xero):
     XeroContactSync.objects.create(entity_id=company.id, xero_contact_id="c-gone", name="Archived In Xero")
     xero.contact_pages = [[{"ContactID": "c-1", "Name": "New Name"}, {"ContactID": "c-2", "Name": "ABC Supplies"}]]
 
-    assert _run(company)["contacts"] == {"added": 1, "linked": 0, "renamed": 1, "followed_merges": 0}
+    assert _run(company)["contacts"] == {"added": 1, "linked": 0, "renamed": 1, "restored": 0,
+                                               "followed_merges": 0}
     names = dict(XeroContactSync.objects.filter(entity_id=company.id).values_list("xero_contact_id", "name"))
     assert names == {"c-1": "New Name", "c-2": "ABC Supplies", "c-gone": "Archived In Xero"}
     assert XeroContactSync.objects.get(xero_contact_id="c-2").xero_org_id == TENANT
@@ -242,7 +273,8 @@ def test_the_route_syncs_the_assertions_company(db, xero):
 
     assert resp.status_code == 200
     assert resp.json() == {"accounts": {"added": 1, "linked": 0, "activated": 0, "refreshed": 0, "archived": 0, "deleted": 0},
-                           "contacts": {"added": 0, "linked": 0, "renamed": 0, "followed_merges": 0}}
+                           "contacts": {"added": 0, "linked": 0, "renamed": 0, "restored": 0,
+                                        "followed_merges": 0}}
 
 
 def test_a_settings_read_runs_at_most_once_every_two_minutes(db, xero):

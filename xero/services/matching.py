@@ -174,6 +174,17 @@ def own_suppliers(entity_id, org=None):
     return active.filter((~Q(record_status="archived") & (unlinked | other_org)) | archived_in_use)
 
 
+def changed_offline(entity_id):
+    """The accounts and contacts changed in Minty while Xero was off (``minty_changed_at``; the user,
+    2026-11-27): a disconnected company is Minty-only, so its rows - linked ones too - are added and
+    edited there; the reconnect's matching asks about them and Finish clears the mark."""
+    accounts = AccountInfo.objects.filter(entity_id=entity_id, minty_changed_at__isnull=False,
+                                          merged_into__isnull=True).exclude(record_status="archived")
+    contacts = XeroContactSync.objects.filter(entity_id=entity_id, minty_changed_at__isnull=False,
+                                              merged_into__isnull=True).exclude(record_status="archived")
+    return accounts, contacts
+
+
 def _active_accounts(entity_id):
     """Every account a matching may touch: active, not combined away, not archived in Xero."""
     return (AccountInfo.objects.filter(entity_id=entity_id, merged_into__isnull=True)
@@ -199,15 +210,18 @@ def scope_accounts(entity_id, org, reason):
 def needs_matching(entity: Entity, tenant_id=None) -> str | None:
     """Why a connect to ``tenant_id`` must match first, or None (the mirror, as before): the company
     keeps its books in Minty with its own accounts (``first``); it had another organisation
-    (``new_org``); or, the same organisation, accounts were made in Minty meanwhile (``new_accounts``)."""
+    (``new_org``); or, the same organisation, accounts were made in Minty meanwhile, or accounts or
+    contacts were added or changed while Xero was off (``new_accounts``; the user, 2026-11-27)."""
     if entity.setup_mode == "minty" and own_accounts(entity.id).exists():
         return "first"
     if not tenant_id or not entity.xero_org_id:
         return None
     if str(entity.xero_org_id) != str(tenant_id):
         return "new_org" if scope_accounts(entity.id, tenant_id, "new_org").exists() else None
-    if entity.setup_mode == "xero" and own_accounts(entity.id).exists():
-        return "new_accounts"
+    if entity.setup_mode == "xero":
+        accounts, contacts = changed_offline(entity.id)
+        if own_accounts(entity.id).exists() or accounts.exists() or contacts.exists():
+            return "new_accounts"
     return None
 
 
@@ -438,7 +452,9 @@ def contact_scope(entity_id, org, reason) -> tuple[list, list[str]]:
     closing's contacts still empty. A change of the matches is about the accounts: it asks nothing."""
     if reason == "change" or not org:
         return [], []
-    return list(own_suppliers(entity_id, org).order_by("name", "id")), pettycash_contacts_missing(entity_id)
+    _accounts, marked = changed_offline(entity_id)
+    suppliers = own_suppliers(entity_id, org) | marked.filter(xero_org_id=str(org))
+    return list(suppliers.distinct().order_by("name", "id")), pettycash_contacts_missing(entity_id)
 
 
 def _contact_copies(entity_id, org) -> list[XeroContact]:
@@ -475,6 +491,25 @@ def _held_contacts(entity_id, suppliers, by_contact) -> tuple[dict, dict]:
     names_of = {s.id: s.name for s in suppliers}
     picked = {d.xero_contact_id: names_of[cid] for cid, d in by_contact.items() if d.xero_contact_id}
     return linked, picked
+
+
+def _prefill_contact_links(entity_id, org, reason) -> int:
+    """Each contact the step asks that is already linked to one of ``org``'s Xero contacts (changed
+    while Xero was off; the user, 2026-11-27) starts on it, as ``_prefill_links`` does for accounts.
+    Existing picks are kept."""
+    suppliers, slots = contact_scope(entity_id, org, reason)
+    by_contact, _ = _contact_drafts(entity_id, suppliers, slots)
+    copies = {c.xero_guid: c for c in _contact_copies(entity_id, org)}
+    taken = {d.xero_contact_id for d in by_contact.values() if d.xero_contact_id}
+    made = 0
+    for supplier in suppliers:
+        copy = copies.get(supplier.xero_contact_id or "")
+        if supplier.id not in by_contact and copy is not None and copy.id not in taken:
+            ContactMatchDraft.objects.create(entity_id=entity_id, contact_id=supplier.id, xero_contact_id=copy.id,
+                                             picked_by=None)
+            taken.add(copy.id)
+            made += 1
+    return made
 
 
 def auto_pick_contacts(entity_id, org, reason="first") -> int:
@@ -527,8 +562,8 @@ def read_contacts(entity: Entity) -> dict:
 
     return {
         "required": reason != "change",
-        "suppliers": [{"contact_id": str(s.id), "name": s.name, "pick": answer(by_contact.get(s.id))}
-                      for s in suppliers],
+        "suppliers": [{"contact_id": str(s.id), "name": s.name, "pick": answer(by_contact.get(s.id)),
+                       "changed_offline": s.minty_changed_at is not None} for s in suppliers],
         "slots": [{"slot": slot, "pick": answer(by_slot.get(slot))} for slot in slots],
         "options": [{"id": str(c.id), "name": c.name, "held_by": held_by(c)}
                     for c in (_contact_copies(entity.id, org) if suppliers or slots else [])],
@@ -574,6 +609,8 @@ def read(entity: Entity) -> dict:
             "group": titles[_group(account_type)],
             "used": account.id in used,
             "system": bool(account.is_system),
+            # changed in Minty while Xero was off: Xero's details win at Finish (the user, 2026-11-27)
+            "changed_offline": account.minty_changed_at is not None,
             "pick": {"xero_account_id": str(copy.id), "auto": draft.picked_by is None,
                      "guess": _is_guess(account, copy, draft)} if copy else None,
             "suggestion": str(suggestion.id) if suggestion else None,
@@ -634,6 +671,7 @@ def begin(entity_id, access_token, org, reason="first") -> None:
     made = _prefill_links(entity_id, org, scope) + auto_pick(entity_id, org, reason)
     made += auto_fill(entity_id, org, reason)
     _drop_stale_contact_drafts(entity_id, org, reason)
+    _prefill_contact_links(entity_id, org, reason)
     auto_pick_contacts(entity_id, org, reason)
     logger.info("xero matching: company %s began matching org %s (%s); %s picked automatically", entity_id, org,
                 reason, made)
@@ -962,6 +1000,10 @@ def finish(entity_id, user_id) -> dict:
             _let_go_of_old_links(entity_id, entity.xero_org_id, in_scope, batch, user_id)
         contacts = _apply_contacts(entity, batch, user_id)
         AccountMatchDraft.objects.filter(entity_id=entity_id).delete()
+        # everything changed while Xero was off has now been asked about (the user, 2026-11-27)
+        AccountInfo.objects.filter(entity_id=entity_id, minty_changed_at__isnull=False).update(minty_changed_at=None)
+        XeroContactSync.objects.filter(entity_id=entity_id, minty_changed_at__isnull=False).update(
+            minty_changed_at=None)
         done = {"setup_mode": "xero", "xero_matching": None}
         if reason in ("first", "new_org", None):
             # the day Finish ran (no longer a publish cut-off - owner, 2026-11-18)
@@ -1020,8 +1062,9 @@ def _apply_contacts(entity: Entity, batch, user_id) -> dict:
         draft = by_contact[supplier.id]
         if draft.add_to_xero:
             counts["new"] += 1  # Minty puts it in Xero at its first publish (C1)
-            if supplier.xero_contact_id and supplier.xero_org_id and supplier.xero_org_id != org:
-                # the old organisation's contact is let go, so that publish never names its id
+            if supplier.xero_contact_id:
+                # its Xero contact is let go - the old organisation's, or this one's for a contact changed
+                # while Xero was off (the user, 2026-11-27) - so that publish never names its id
                 XeroContactSync.objects.filter(id=supplier.id).update(xero_contact_id=None, xero_org_id=None,
                                                                       xero_contact_link_id=None)
                 ContactChangeLog.objects.create(entity_id=entity.id, contact_id=supplier.id, batch_id=batch,
@@ -1036,6 +1079,8 @@ def _apply_contacts(entity: Entity, batch, user_id) -> dict:
             if stored.record_status != "active" or stored.merged_into_id is not None:
                 raise Refused(taken_by_archived(stored))
             raise Refused(CONTACT_TAKEN.format(name=stored.name))
+        if supplier.xero_contact_id == copy.xero_guid and supplier.xero_org_id == org:
+            continue  # changed while Xero was off and kept on its own Xero contact: nothing to write
         _link_supplier(entity.id, supplier, copy.xero_guid, copy.name, org, batch, user_id, "linked")
         counts["linked"] += 1
     columns = dict(PETTYCASH_CONTACTS)

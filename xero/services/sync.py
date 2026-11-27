@@ -60,6 +60,7 @@ from django.utils import timezone
 from minty_db.models import (
     AccountChangeLog,
     AccountInfo,
+    AccountModule,
     EntityAccountXero,
     EntityBillAccountXero,
     XeroAccount,
@@ -300,6 +301,16 @@ def apply_accounts(entity_id, accounts: list[dict], org, skip: frozenset = froze
                 row.status = "ACTIVE"
                 changed.append("status")
                 counts["activated"] += 1
+            elif row.record_status == "archived" and row.status == "ACTIVE" and _status(account) == "ACTIVE":
+                # archived in Minty while Xero was off (Minty's mark, Xero's status untouched): once
+                # connected the chart is Xero's, so it comes back - in the pickers again (the user, 2026-11-27)
+                row.record_status = "active"
+                changed.append("record_status")
+                counts["activated"] += 1
+                EntityAccountXero.objects.filter(account_id=row.id).update(is_active=True)
+                AccountModule.objects.filter(account_id=row.id).update(is_active=True)
+                EntityBillAccountXero.objects.filter(entity_id=entity_id, xero_account_id=row.xero_account_id).update(
+                    is_active=True, is_deleted=False)
             code = str(account.get("Code") or "").strip()
             before = (row.xero_code, row.name, row.account_type)
             if account.get("Type") not in COA_EXCLUDED_TYPES and code:
@@ -312,7 +323,7 @@ def apply_accounts(entity_id, accounts: list[dict], org, skip: frozenset = froze
                         changed.append(field)
             if changed:
                 row.save(update_fields=sorted(set(changed)))
-                if set(changed) - {"status"}:
+                if set(changed) - {"status", "record_status"}:
                     _log(entity_id, row, "overwritten", before, batch, org)
                     counts["refreshed"] += 1
                     renamed.append(row.id)
@@ -448,7 +459,7 @@ def _mirror_bills(entity_id) -> None:
 
 def apply_contacts(entity_id, contacts: list[dict], org) -> dict:
     """New contacts added, changed names updated; nothing removed."""
-    counts = {"added": 0, "linked": 0, "renamed": 0}
+    counts = {"added": 0, "linked": 0, "renamed": 0, "restored": 0}
     with transaction.atomic():
         lock(entity_id)
         stored = {c.xero_contact_id: c for c in XeroContactSync.objects.filter(entity_id=entity_id)}
@@ -476,11 +487,18 @@ def apply_contacts(entity_id, contacts: list[dict], org) -> dict:
                                                name=name)
                 stored[contact_id] = True
                 counts["added"] += 1
-            elif row is not True and (row.name or "") != name:
-                row.name = name
-                row.save(update_fields=["name"])
-                counts["renamed"] += 1
-                renamed.append(row.id)
+            elif row is not True:
+                if row.record_status == "archived" and row.merged_into_id is None:
+                    # archived in Minty while Xero was off: Xero still has it, so it comes back (the
+                    # user, 2026-11-27); a merged-away row stays the record of its merge
+                    row.record_status = "active"
+                    row.save(update_fields=["record_status"])
+                    counts["restored"] += 1
+                if (row.name or "") != name:
+                    row.name = name
+                    row.save(update_fields=["name"])
+                    counts["renamed"] += 1
+                    renamed.append(row.id)
         bill_text.refresh_contacts(entity_id, renamed)  # the user's rule, 2026-11-24
         if org:
             _copy_contacts(entity_id, contacts, org)

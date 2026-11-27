@@ -11,10 +11,17 @@ Its answer and status come back as they are; onboarding-api checks the person's 
 Viewing is ``COA_VIEW`` (cashier and up); adding, changing and deleting accounts and contacts are
 ``COA_CREATE`` / ``COA_UPDATE`` / ``COA_DELETE`` (accountant and up).
 
+``POST .../accounts/<id>/archive`` and ``.../restore`` (and the same for contacts; the user,
+2026-11-27): archive needs ``COA_DELETE``, restore ``COA_CREATE``; onboarding-api decides the rest.
+
 ``POST .../contacts/merge {"ids": [<id>, ...], "keep": <id>}`` merges contacts here, not in
 onboarding-api: several ticked contacts absorbed into the one kept (the user, 2026-11-25), accounts-api's
 one implementation (``xero/services/merge.py``, the owner's decisions doc M1-M4). ``COA_DELETE`` - a
 merge takes some away. Accounts are never merged (the user, 2026-11-24).
+
+A rename that went through (``PATCH .../accounts/<id>`` or ``.../contacts/<id>`` answered 200) relabels
+the bills on it (``xero/services/bill_text.py``): records keep the id and show the name as it is now,
+their text copies included (the user, 2026-11-27) - as matching, merges and Xero renames do.
 
 Opening the contact list reads the company's contacts from Xero first - read only, at most once
 every 2 minutes (owner's decisions doc C2, 2026-11-19), as Petty Cash Settings does.
@@ -33,6 +40,7 @@ from minty_shared import tokens
 from hub.company import _body, _open, _uuid
 from hub.policy import Permission
 from hub.transport import refuse, respond
+from xero.services import bill_text
 from xero.services import merge as merging
 from xero.services import sync as xero_sync
 from xero.services.tokens import resolve_entity_access_token
@@ -78,7 +86,18 @@ def _forward(request: HttpRequest, user, entity_id: str, path: str) -> HttpRespo
     if answer.status_code == 401:  # our own assertion refused: a key mismatch, never the person's fault
         logger.error("company chart: onboarding-api refused this service's assertion")
         return refuse(request, UNAVAILABLE, 503)
+    if request.method == "PATCH" and answer.status_code == 200:
+        _relabel_bills(entity_id, path)
     return respond(request, payload, answer.status_code)
+
+
+def _relabel_bills(entity_id, path: str) -> None:
+    """The bills on a renamed account or contact take its name now (``bill_text``)."""
+    kind, _, row_id = path.partition("/")
+    if kind == "accounts":
+        bill_text.refresh_accounts(entity_id, [row_id])
+    elif kind == "contacts":
+        bill_text.refresh_contacts(entity_id, [row_id])
 
 
 def _door(request: HttpRequest, methods: tuple[str, ...], path: str) -> HttpResponse:
@@ -128,6 +147,44 @@ def company_contact(request: HttpRequest, contact_id: str) -> HttpResponse:
     if contact_id is None and request.method != "OPTIONS":
         return refuse(request, "That contact isn't in this company. Reload the list and try again.", 404)
     return _door(request, ("PATCH", "DELETE"), f"contacts/{contact_id}")
+
+
+#: Archive takes a row off every picker - the delete right; restore brings one back - the add right
+#: (the user, 2026-11-27). Both are onboarding-api's (``chart.archive_*`` / ``chart.restore_*``).
+ARCHIVE = {
+    "archive": (Permission.COA_DELETE, "You don't have permission to archive this company's accounts and contacts."),
+    "restore": (Permission.COA_CREATE, "You don't have permission to restore this company's accounts and contacts."),
+}
+
+
+def _archive_door(request: HttpRequest, kind: str, row_id: str, action: str) -> HttpResponse:
+    if request.method not in ("POST", "OPTIONS"):
+        return refuse(request, "Method not allowed", 405)
+    row_id = _uuid(row_id)
+    if row_id is None and request.method != "OPTIONS":
+        what = "account" if kind == "accounts" else "contact"
+        return refuse(request, f"That {what} isn't in this company. Reload the list and try again.", 404)
+    permission, denied = ARCHIVE[action]
+    early, user, entity_id = _open(request, permission, denied)
+    if early is not None:
+        return early
+    return _forward(request, user, entity_id, f"{kind}/{row_id}/{action}")
+
+
+def company_account_archive(request: HttpRequest, account_id: str) -> HttpResponse:
+    return _archive_door(request, "accounts", account_id, "archive")
+
+
+def company_account_restore(request: HttpRequest, account_id: str) -> HttpResponse:
+    return _archive_door(request, "accounts", account_id, "restore")
+
+
+def company_contact_archive(request: HttpRequest, contact_id: str) -> HttpResponse:
+    return _archive_door(request, "contacts", contact_id, "archive")
+
+
+def company_contact_restore(request: HttpRequest, contact_id: str) -> HttpResponse:
+    return _archive_door(request, "contacts", contact_id, "restore")
 
 
 MERGE_DENIED = "You don't have permission to merge this company's contacts."

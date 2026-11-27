@@ -556,7 +556,16 @@ pointing at nothing.
   pending check reads it. A connect decides (`needs_matching(entity, tenant)`): another organisation
   than the one recorded → `new_org`, matched from scratch (copies + automatic picks only; nothing
   mirrored, archived or deleted before Finish; this used to mirror the new chart over the old one);
-  the same organisation with an account not linked yet (made in Minty meanwhile) → `new_accounts`. The
+  the same organisation with an account not linked yet (made in Minty meanwhile), or any account or
+  contact changed in Minty while Xero was off (`minty_changed_at`, minty-db v0.21; the user, 2026-11-27:
+  a disconnected company is Minty-only) → `new_accounts`; its contacts step then also asks the marked
+  contacts linked to this organisation, each starting on its own Xero contact (`_prefill_contact_links`;
+  one kept writes nothing, "New in Xero" lets its link go), the rows say `changed_offline`, and Finish
+  clears every mark - Xero's details win at the sync right after. An account or contact archived in Minty
+  while disconnected (Minty's mark: `record_status` archived, Xero's status still ACTIVE) comes back at
+  the sync while Xero has it (`apply_accounts` turns its pickers' rows on again; `apply_contacts`
+  `restored`), as one deleted comes back as a Xero row: a connected company's chart is Xero's. Settings'
+  renames relabel the bills on them (`hub/company_chart._relabel_bills` → `bill_text`). The
   scope (`scope_accounts`) is every active account (the user, 2026-11-24: a reconnect shows them all;
   the ones linked to the current organisation prefilled - `_prefill_links`); `first` is the company's
   own accounts. `new_org` also covers every archived account (in Xero or in Minty) that a record uses

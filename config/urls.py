@@ -71,10 +71,18 @@ urlpatterns = [
     # Settings' accounts and contacts, held by onboarding-api (2026-11-12)
     path("api/me/company/accounts", company_chart.company_accounts, name="company_accounts"),
     path("api/me/company/accounts/<str:account_id>", company_chart.company_account, name="company_account"),
+    path("api/me/company/accounts/<str:account_id>/archive", company_chart.company_account_archive,
+         name="company_account_archive"),
+    path("api/me/company/accounts/<str:account_id>/restore", company_chart.company_account_restore,
+         name="company_account_restore"),
     path("api/me/company/contacts", company_chart.company_contacts, name="company_contacts"),
     # before contacts/<id>: "merge" would otherwise be read as a contact's id
     path("api/me/company/contacts/merge", company_chart.company_contacts_merge, name="company_contacts_merge"),
     path("api/me/company/contacts/<str:contact_id>", company_chart.company_contact, name="company_contact"),
+    path("api/me/company/contacts/<str:contact_id>/archive", company_chart.company_contact_archive,
+         name="company_contact_archive"),
+    path("api/me/company/contacts/<str:contact_id>/restore", company_chart.company_contact_restore,
+         name="company_contact_restore"),
     path("api/me/company/xero/disconnect", company.company_xero_disconnect, name="company_xero_disconnect"),
     path("api/me/company/xero/release", company.company_xero_release, name="company_xero_release"),
     # Settings Phase 2 (2026-11-11): matching a Minty company's accounts to Xero on connect.
