@@ -1108,8 +1108,9 @@ def _link_supplier(entity_id, supplier, guid, name, org, batch, user_id, kind) -
                                           name=(name or supplier.name)[:255], status="ACTIVE")
     XeroContactSync.objects.filter(id=supplier.id).update(xero_contact_id=guid, xero_org_id=str(org),
                                                           xero_contact_link_id=copy.id)
+    now = sync.take_xero_name(entity_id, supplier.id, supplier.name, name or copy.name)
     ContactChangeLog.objects.create(entity_id=entity_id, contact_id=supplier.id, batch_id=batch, kind=kind,
-                                    before_name=supplier.name, after_name=supplier.name, xero_org_id=str(org),
+                                    before_name=supplier.name, after_name=now, xero_org_id=str(org),
                                     xero_guid=guid, changed_by=user_id)
 
 

@@ -528,6 +528,29 @@ def test_the_connect_sync_keeps_a_minty_supplier_and_sends_nothing_to_xero(compa
     assert xero.made == []  # connecting creates nothing in Xero (C2)
 
 
+def test_the_connect_sync_never_deletes_a_merged_away_contact(company, xero):
+    """A merged-away row is the record of its merge (minty_merge, contact_change_log), never deleted
+    (2026-11-27: the connect sync deleted it - nothing uses it, and Xero no longer lists it)."""
+    from minty_db.models import ContactChangeLog
+
+    from xero.services.connect import background_sync
+
+    kept = XeroContactSync.objects.create(entity_id=company.id, xero_contact_id="c-1", name="ABC Supplies")
+    merged = XeroContactSync.objects.create(entity_id=company.id, xero_contact_id="c-old", name="ABC Supplies Ltd",
+                                            record_status="archived", merged_into_id=kept.id)
+    ContactChangeLog.objects.create(entity_id=company.id, contact_id=merged.id, batch_id=uuid.uuid4(), kind="merged",
+                                    before_name=merged.name, after_name=kept.name, merged_into_id=kept.id)
+    XeroContactSync.objects.create(entity_id=company.id, xero_contact_id="c-gone", name="Gone From Xero")
+    xero.contact_pages = [[{"ContactID": "c-1", "Name": "ABC Supplies"}]]
+    xero.accounts = [acct("a-1", "429", "General")]
+
+    background_sync(company.id, "tok", TENANT)
+
+    assert XeroContactSync.objects.filter(id=merged.id).exists()
+    assert ContactChangeLog.objects.filter(contact_id=merged.id).exists(), "its merge history stays"
+    assert not XeroContactSync.objects.filter(entity_id=company.id, name="Gone From Xero").exists()
+
+
 def test_a_xero_contact_of_a_minty_contacts_name_links_to_it_never_a_second_row(company, xero):
     """No duplicates (owner, 2026-11-12): case and inner spaces don't count."""
     own = XeroContactSync.objects.create(entity_id=company.id, name="Kee  Wah", source="user")
@@ -538,6 +561,20 @@ def test_a_xero_contact_of_a_minty_contacts_name_links_to_it_never_a_second_row(
     assert XeroContactSync.objects.filter(entity_id=company.id).count() == 1
     own.refresh_from_db()
     assert (own.xero_contact_id, own.xero_org_id) == ("c-kee", TENANT)
+    assert own.name == "KEE WAH", "Xero's name at the link (the user, 2026-11-27)"
+
+
+def test_a_contact_linked_by_name_relabels_its_bills_at_once(company, xero):
+    from minty_db.models import Bill
+
+    own = XeroContactSync.objects.create(entity_id=company.id, name="7 Eleven", source="user")
+    bill = Bill.objects.create(entity_id=company.id, reference="B-7", contact_id=own.id, contact_name="7 Eleven")
+    xero.contact_pages = [[{"ContactID": "c-7", "Name": "7-Eleven"}]]
+
+    _run(company)
+
+    assert XeroContactSync.objects.get(id=own.id).name == "7-Eleven"
+    assert Bill.objects.get(id=bill.id).contact_name == "7-Eleven"
     assert xero.made == []
 
 

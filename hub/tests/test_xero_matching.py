@@ -420,6 +420,7 @@ def test_the_contacts_step_picks_the_same_name_and_asks_for_the_rest(minty, xero
     entity = minty["entity"]
     abc = XeroContactSync.objects.create(entity_id=entity.id, name="  abc   supplies ", source="user")
     new = XeroContactSync.objects.create(entity_id=entity.id, name="Wing Lee Trading Co.", source="user")
+    bill = Bill.objects.create(entity_id=entity.id, reference="B-ABC", contact_id=abc.id, contact_name=abc.name)
     call("post", BASE + "/refresh", minty["admin"], entity.id)  # contacts made after the connect
     _match_everything(minty)
 
@@ -437,10 +438,13 @@ def test_the_contacts_step_picks_the_same_name_and_asks_for_the_rest(minty, xero
     assert _answer(minty, {"contact_id": str(new.id), "new": True}).status_code == 200
     body = call("post", BASE + "/finish", minty["admin"], entity.id).json()
     assert (body["connected"], body["failed_contacts"]) == (True, [])
-    assert XeroContactSync.objects.get(id=abc.id).xero_contact_id == "c-abc"
+    abc.refresh_from_db()
+    # Xero's name at the link, never a silent flip at the next sync (the user, 2026-11-27)
+    assert (abc.xero_contact_id, abc.name) == ("c-abc", "ABC Supplies")
+    assert Bill.objects.get(id=bill.id).contact_name == "ABC Supplies", "its bills relabelled at once"
     assert XeroContactSync.objects.get(id=new.id).xero_contact_id is None, "new in Xero at its first publish"
-    kinds = list(ContactChangeLog.objects.filter(entity_id=entity.id).values_list("kind", flat=True))
-    assert kinds == ["linked"]
+    logs = list(ContactChangeLog.objects.filter(entity_id=entity.id).values_list("kind", "before_name", "after_name"))
+    assert logs == [("linked", "  abc   supplies ", "ABC Supplies")]
     assert Entity.objects.get(id=entity.id).status == "connected"
 
 

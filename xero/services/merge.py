@@ -201,8 +201,10 @@ def relink_contact(entity_id, contact_id, xero_guid: str, user_id, *, reason: st
         copy = XeroContact.objects.filter(entity_id=entity_id, xero_org_id=str(org), xero_guid=xero_guid).first()
         XeroContactSync.objects.filter(id=contact.id).update(xero_contact_id=xero_guid, xero_org_id=str(org),
                                                              xero_contact_link_id=copy.id if copy else None)
+        # Xero's name at the link, its bills following (the user, 2026-11-27); no copy yet: the next sync
+        now = sync.take_xero_name(entity_id, contact.id, contact.name, copy.name if copy else None)
         ContactChangeLog.objects.create(entity_id=entity_id, contact_id=contact.id, batch_id=uuid.uuid4(),
-                                        kind="linked", before_name=contact.name, after_name=contact.name,
+                                        kind="linked", before_name=contact.name, after_name=now,
                                         xero_org_id=str(org), xero_guid=xero_guid, changed_by=user_id)
         logger.info("merge: company %s contact %s relinked to Xero contact %s (%s)", entity_id, contact.id,
                     xero_guid, reason)

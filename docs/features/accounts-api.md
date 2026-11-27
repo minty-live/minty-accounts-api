@@ -666,6 +666,12 @@ step, Try again, "map it now"); merging is the Settings Merge, or Minty followin
     (`relink_contact`, `merged_in_xero`).
   - This runs before the list's new contacts are added, so the kept contact is never a second row
     first.
+- **A linked contact takes Xero's name at the link** (the user, 2026-11-27; it kept its Minty name until
+  the next sync silently renamed it): matching's `_link_supplier`, the sync's link by name and
+  `relink_contact` go through `sync.take_xero_name`, which renames it and relabels its bills
+  (`bill_text.refresh_contacts`); `contact_change_log.after_name` is Xero's name.
+- **A connect's sync never deletes a merged-away contact** (2026-11-27): `connect.background_sync` drops
+  only unmerged contacts Xero no longer lists and nothing uses - a merged row is the record of its merge.
   - One archived with no merge is left for publish (C4). The sync's contact counts carry
     `followed_merges`.
 - **The sync keeps merged rows**: `apply_accounts` never touches a row with `merged_into_id` (it used to

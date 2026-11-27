@@ -457,6 +457,18 @@ def _mirror_bills(entity_id) -> None:
             xero_account_id="").exclude(xero_account_id__in=live).delete()
 
 
+def take_xero_name(entity_id, contact_id, current: str, xero_name) -> str:
+    """A Minty contact linked to a Xero contact takes Xero's name at the link (the user, 2026-11-27:
+    linked contacts are changed in Xero and Minty follows - never a silent flip at the next sync), and
+    the bills on it follow at once (``bill_text``). Returns the name it has now."""
+    name = _trunc(xero_name or "", 150) or ""
+    if not name or name == current:
+        return current
+    XeroContactSync.objects.filter(id=contact_id).update(name=name)
+    bill_text.refresh_contacts(entity_id, [contact_id])
+    return name
+
+
 def apply_contacts(entity_id, contacts: list[dict], org) -> dict:
     """New contacts added, changed names updated; nothing removed."""
     counts = {"added": 0, "linked": 0, "renamed": 0, "restored": 0}
@@ -479,6 +491,7 @@ def apply_contacts(entity_id, contacts: list[dict], org) -> dict:
             row = stored.get(contact_id)
             if row is None and (mine := own.pop(names.name_key(name) or None, None)) is not None:
                 XeroContactSync.objects.filter(id=mine.id).update(xero_contact_id=contact_id, xero_org_id=str(org))
+                take_xero_name(entity_id, mine.id, mine.name, name)
                 stored[contact_id] = True
                 counts["linked"] += 1
                 continue

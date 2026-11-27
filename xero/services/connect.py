@@ -419,8 +419,10 @@ def background_sync(entity_id, access_token, tenant_id) -> None:
                 removed = 0
                 if fetched:
                     # Only a Xero contact nothing uses: a supplier Minty made has no Xero id, and one an
-                    # expense, a bill or daily closing names stays (2026-11-11).
-                    removed = (XeroContactSync.objects.filter(entity_id=entity_id, xero_contact_id__isnull=False)
+                    # expense, a bill or daily closing names stays (2026-11-11). A merged-away row is the
+                    # record of its merge and is never deleted (2026-11-27).
+                    removed = (XeroContactSync.objects.filter(entity_id=entity_id, xero_contact_id__isnull=False,
+                                                              merged_into__isnull=True)
                                .exclude(xero_contact_id="").exclude(xero_contact_id__in=fetched)
                                .exclude(id__in=usage.used_contact_ids(entity_id)).delete()[0])
                 counts = sync.apply_contacts(entity_id, contacts, tenant_id)

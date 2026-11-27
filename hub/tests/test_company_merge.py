@@ -14,6 +14,7 @@ import pytest
 from minty_db.models import (
     AccountInfo,
     Bill,
+    ContactChangeLog,
     EntityPettycashSettings,
     MintyMerge,
     MintyMergeRecord,
@@ -193,6 +194,25 @@ def test_a_contact_xero_merged_follows_xeros_kept_contact(shop):
     kee.refresh_from_db()
     assert kee.xero_contact_id == "x-kept"
     assert not MintyMerge.objects.exists()
+
+
+def test_a_relinked_contact_takes_its_xero_contacts_name_and_its_bills_follow(shop):
+    """Xero's name at the link (the user, 2026-11-27): the stored copy's name, the bills relabelled."""
+    from minty_db.models import Entity, XeroContact
+
+    entity = shop["entity"]
+    org = str(uuid.uuid4())
+    Entity.objects.filter(id=entity.id).update(xero_org_id=org)
+    XeroContact.objects.create(entity_id=entity.id, xero_org_id=org, xero_guid="x-kept", name="Kee Wah Bakery",
+                               status="ACTIVE")
+    kee = XeroContactSync.objects.create(entity_id=entity.id, name="Kee Wah", xero_contact_id="x-old", source="xero")
+    bill = Bill.objects.create(entity_id=entity.id, reference="B-KEE", contact_id=kee.id, contact_name="Kee Wah")
+    assert _relink(entity.id, kee.id, {"xero_contact_id": "x-kept", "reason": "merged_in_xero"}).status_code == 200
+    kee.refresh_from_db()
+    assert (kee.xero_contact_id, kee.name) == ("x-kept", "Kee Wah Bakery")
+    assert Bill.objects.get(id=bill.id).contact_name == "Kee Wah Bakery"
+    log = ContactChangeLog.objects.get(contact_id=kee.id)
+    assert (log.before_name, log.after_name) == ("Kee Wah", "Kee Wah Bakery")
 
 
 def test_xeros_kept_contact_already_another_minty_contact_merges_the_two(shop):
