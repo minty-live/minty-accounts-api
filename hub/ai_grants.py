@@ -1,5 +1,6 @@
 """AI allowances for Minty support (owner, 2026-11-18): every superuser can see each company's AI
-grants and use, and give a company a grant - a top-up, or a size other than the default.
+grants and use, and give a company a grant by hand - a top-up. The automatic ones are the 30-day AI
+trial and one grant per billing period after it (the user, 2026-11-27; minty-shared v0.28).
 
     GET  /api/me/ai/companies[?q=&page=|?ids=]  the companies, each with what is left of its grants
     GET  /api/me/ai/companies/<id>            one company: its grants, its last reads
@@ -10,7 +11,7 @@ grants and use, and give a company a grant - a top-up, or a size other than the 
 The allowance itself is minty-db's ``ai_policy``/``ai_grant``/``ai_read`` through
 ``minty_shared.django.ai_allowance`` - the same code the two readers (minty-petty-cash-api,
 minty-payment-request-api) reserve and charge with, so this page and the read button never disagree.
-The models, the default grant and the extra caps stay on minty-petty-cash-api's
+The models, the trial and period sizes and the extra caps stay on minty-petty-cash-api's
 ``manage.py ai_policy`` (owner: grants only here). Superusers only; anyone else is refused (403).
 """
 
@@ -96,7 +97,7 @@ def _open_totals(grants: list[ai_allowance.GrantUsage], now: datetime) -> tuple[
 def ai_companies(request: HttpRequest) -> HttpResponse:
     """``GET /api/me/ai/companies``: every company not archived, A to Z (``q`` filters by name), a
     page of ``PAGE_SIZE``, each with what is left of its grants, its answered reads and its last
-    read. A company never given a grant shows the default it will get on its first read.
+    read. A grant due but not given yet (the trial, this period's) counts, as the readers count it.
     ``ids`` (comma-separated, at most ``MAX_IDS``) answers exactly those companies, no page - the
     entity list's "AI allowances" mode asks for the rows it shows."""
     early, _user = _superuser(request, ("GET",))
@@ -128,6 +129,7 @@ def ai_companies(request: HttpRequest) -> HttpResponse:
     ids = [r["id"] for r in rows]
     now = timezone.now()
     grants = ai_allowance.grants_of_many(ids, now)
+    subscriptions = ai_allowance.subscriptions_of_many(ids)
     reads = {
         r["entity_id"]: r
         for r in AiRead.objects.filter(entity_id__in=ids).values("entity_id").annotate(
@@ -136,8 +138,9 @@ def ai_companies(request: HttpRequest) -> HttpResponse:
     out = []
     for r in rows:
         mine = grants.get(str(r["id"]), [])
-        allowance = ai_allowance.grant_allowance(mine, policy, now)
-        used, given = _open_totals(ai_allowance.with_default(mine, policy, now), now)
+        subscription = subscriptions.get(str(r["id"]), ai_allowance.Subscription())
+        allowance = ai_allowance.grant_allowance(mine, policy, subscription, now)
+        used, given = _open_totals(ai_allowance.with_due(mine, policy, subscription, now)[0], now)
         read = reads.get(r["id"]) or {}
         out.append({
             "id": str(r["id"]),
@@ -183,6 +186,7 @@ def _detail(entity: Entity, policy: ai_allowance.Policy) -> dict:
         "company": {"id": str(entity.id), "name": entity.name},
         "allowance": ai_allowance.status(entity.id, policy).as_dict(),
         "default_grant": None if spec is None else {"tokens": spec.tokens, "reads": spec.reads, "days": spec.days},
+        "cycle_tokens": policy.cycle_tokens,
         "grants": grants,
         "reads": reads,
         "reads_more": more,

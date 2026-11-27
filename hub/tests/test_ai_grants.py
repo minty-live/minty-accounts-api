@@ -8,7 +8,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from minty_db.models import AiGrant, AiPolicy, AiRead, Entity
+from minty_db.models import AiGrant, AiPolicy, AiRead, Entity, EntityModuleSubscription
 from minty_shared.django import ai_allowance
 
 from hub.tests.test_archive import archive, superuser
@@ -72,9 +72,21 @@ def test_the_list_shows_each_company_s_allowance(shop, policy):
     assert (mine["percent_left"], mine["tokens_used"], mine["tokens_given"]) == (75, 5000, 20000)
     assert (mine["has_grant"], mine["reads"], mine["blocked"]) == (True, 1, False)
     assert mine["last_read_at"] is not None
-    # never given a grant: the default it will get on its first read
-    assert (other["percent_left"], other["tokens_given"], other["has_grant"]) == (100, 20000, False)
+    # no module subscription yet: no AI trial to count
+    assert (other["percent_left"], other["tokens_given"], other["has_grant"]) == (0, None, False)
     assert resp.json()["total"] == 2
+
+
+def test_a_company_on_a_module_trial_shows_the_ai_trial_it_will_get(shop, policy):
+    """The user, 2026-11-27: the AI trial starts with the company's first module trial and is
+    counted before its first read, as the readers count it."""
+    EntityModuleSubscription.objects.create(entity_id=shop["other"].id, function_code="PETTY_CASH", phase="trial",
+                                            trial_end=datetime.now(UTC) + timedelta(days=29))
+
+    rows = {r["name"]: r for r in call("get", LIST, superuser()).json()["companies"]}
+
+    other = rows["Other Co"]
+    assert (other["percent_left"], other["tokens_given"], other["has_grant"]) == (100, 20000, False)
 
 
 def test_the_list_finds_a_company_by_name_and_leaves_archived_ones_out(shop, policy):
@@ -121,6 +133,7 @@ def test_a_company_shows_its_grants_newest_first_and_its_reads(shop, policy):
     assert body["company"] == {"id": str(shop["entity"].id), "name": "Olive & Vine"}
     assert body["allowance"]["percent_left"] == 100 and body["allowance"]["blocked"] is False
     assert body["default_grant"] == {"tokens": 20000, "reads": None, "days": None}
+    assert body["cycle_tokens"] is None  # the fixture's policy gives no period grants
     newest, oldest = body["grants"]
     assert (newest["source"], newest["tokens_total"], newest["open"], newest["note"]) == ("manual", 50000, True, "pilot")
     assert (oldest["source"], oldest["tokens_used"], oldest["open"]) == ("default", 20500, False)

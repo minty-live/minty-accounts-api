@@ -9,16 +9,24 @@ AI against its own **grants** - minty-db v0.13's `ai_grant` - and every **superu
 
 | Route | What |
 |---|---|
-| `GET /api/me/ai/companies[?q=&page=\|?ids=]` | Companies not archived, A to Z, 25 a page (`q` filters by name; `ids` = exactly those companies, at most 500, no page - the list's AI mode): `percent_left`, `blocked`, `tokens_used`/`tokens_given` over the grants that still have room, `has_grant` (false = the default grant it gets on its first read), answered `reads`, `last_read_at`; `total` |
-| `GET /api/me/ai/companies/<id>` | One company: `allowance` (grants and the extra caps), `default_grant`, every grant newest first (`source`, totals, used, `expires_at`, `open`, `granted_by`, `note`), its 20 newest reads (each with its `id`) and `reads_more` when older ones are left |
+| `GET /api/me/ai/companies[?q=&page=\|?ids=]` | Companies not archived, A to Z, 25 a page (`q` filters by name; `ids` = exactly those companies, at most 500, no page - the list's AI mode): `percent_left`, `blocked`, `tokens_used`/`tokens_given` over the grants that still have room, `has_grant` (false = nothing given yet; a grant due counts - the AI trial of a company on a module trial, or a paying company's period grant), answered `reads`, `last_read_at`; `total` |
+| `GET /api/me/ai/companies/<id>` | One company: `allowance` (grants and the extra caps), `default_grant` (the AI trial's size), `cycle_tokens` (each billing period's), every grant newest first (`source` = `trial` \| `cycle` \| `manual` \| `default`, totals, used, `expires_at`, `open`, `granted_by`, `note`), its 20 newest reads (each with its `id`) and `reads_more` when older ones are left |
 | `GET /api/me/ai/companies/<id>/reads?before=<read id>` | "Show more reads" (owner, 2026-11-19): the next 20 reads older than that read, `{reads, more}`. The cursor is (created_at, id), compared in the database; a read that isn't this company's is 404 |
 | `POST /api/me/ai/companies/<id>/grants` | `{tokens?, reads?, days?, note?}` - at least tokens or reads; tokens 1-10,000,000, reads 1-10,000, days 1-3,650 (empty = no end), note up to 255; commas allowed. `granted_by` = the superuser's email. 201 with the company again and `message`; 422 `{error, fields}` with one sentence per field |
-| `POST /api/me/ai/companies/<id>/grants/<grant id>/end` | End that grant now (owner, 2026-11-20): its unused tokens and reads can't be used anymore. Sets `expires_at` (what the allowance counts by) and `ended_at`/`ended_by` (the superuser's email; minty-db v0.16) together; the grant stays in the list as Ended, so the one-time default grant never comes back. 404 "I couldn't find that grant." for another company's grant; 409 "This grant has already ended." when it has ended or expired. Answers the company with `message: "Grant ended."`; each grant in the company's answer carries `ended_at` and `ended_by` |
+| `POST /api/me/ai/companies/<id>/grants/<grant id>/end` | End that grant now (owner, 2026-11-20): its unused tokens and reads can't be used anymore. Sets `expires_at` (what the allowance counts by) and `ended_at`/`ended_by` (the superuser's email; minty-db v0.16) together; the grant stays in the list as Ended, so an ended trial never comes back and an ended period grant is not given again in that period (the next period's comes as usual). 404 "I couldn't find that grant." for another company's grant; 409 "This grant has already ended." when it has ended or expired. Answers the company with `message: "Grant ended."`; each grant in the company's answer carries `ended_at` and `ended_by` |
 
-Code: `hub/ai_grants.py` on `minty_shared.django.ai_allowance` (minty-shared-py v0.7) - the same
+The automatic grants (the user, 2026-11-27; minty-shared v0.28): a company's 30-day **AI trial**
+(`ai_policy.default_grant`, once ever, from its first module subscription) and, after it, **one
+grant per billing period** (`ai_policy.cycle_tokens`, from the payer's anchor, prorated like billing
+for the first period, only while a paid module's access stands). Grants given here are top-ups: a
+read uses the grant that expires soonest, so a top-up with no end date carries over. The full rules
+are minty-petty-cash-api's `docs/features/expense-ai.md`.
+
+Code: `hub/ai_grants.py` on `minty_shared.django.ai_allowance` (minty-shared-py v0.28:
+`grants_of_many` + `subscriptions_of_many` for the list, `grant_allowance`/`with_due`) - the same
 code the two readers reserve and charge with, so the page and the read button never disagree. A
-missing or unusable `ai_policy` row answers 503 (reading is off). The models, the default grant and
-the extra caps are not here (owner: grants only); they stay on minty-petty-cash-api's
+missing or unusable `ai_policy` row answers 503 (reading is off). The models, the trial and period
+sizes and the extra caps are not here (owner: grants only); they stay on minty-petty-cash-api's
 `manage.py ai_policy`.
 
 Tests: `hub/tests/test_ai_grants.py`.
