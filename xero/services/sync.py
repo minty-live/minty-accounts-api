@@ -42,9 +42,9 @@ times each time Petty Cash Settings opened; this asks once and does all of it:
   removed: a link or a published record may name it. A row Minty made itself (no Xero id) is left
   alone.
 
-A failed or empty fetch changes nothing. Each half runs in one transaction under Flask's lock
-(``pg_advisory_xact_lock(hashtextextended('xero-sync:<entity>', 0))``), so it never overlaps
-Flask's own syncs while both exist.
+A failed or empty fetch changes nothing. Each half runs in one transaction under the company's sync
+lock (``lock``: ``pg_advisory_xact_lock(hashtextextended('xero-sync:<entity>', 0))``, Flask's key), so
+two syncs of one company never overlap. It is taken before any lock on the company row.
 """
 
 from __future__ import annotations
@@ -199,8 +199,14 @@ def _contacts(entity_id, access_token, org, contacts: list[dict] | None) -> dict
 
 
 def lock(entity_id) -> None:
-    """Flask's ``lock_entity_xero_sync``: one sync at a time writes this company's Xero rows.
-    Transaction-scoped: call inside ``transaction.atomic``."""
+    """One sync at a time writes this company's Xero rows (Flask's ``lock_entity_xero_sync``, the same
+    key). Transaction-scoped: call inside ``transaction.atomic``; taking it again in the same
+    transaction is free.
+
+    **Take it before any row lock on the company, its ``entities`` row included.** Every write under
+    it to a table with a foreign key to ``entities`` takes ``FOR KEY SHARE`` on the company row, so a
+    transaction holding that row ``FOR UPDATE`` while it waits here deadlocks with the sync that holds
+    the lock (production, 2026-11-26: ``matching.sync_during_change``; ``hub/tests/test_xero_lock_order.py``)."""
     with connection.cursor() as cursor:
         cursor.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", [f"xero-sync:{entity_id}"])
 

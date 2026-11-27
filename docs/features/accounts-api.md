@@ -173,11 +173,17 @@ minty-web hides Disconnect once it is disconnected.
 
 **Safety:**
 - A failed or empty fetch changes nothing.
-- Each half is one transaction under Flask's lock,
-  `pg_advisory_xact_lock(hashtextextended('xero-sync:<entity>', 0))`. So it never overlaps Flask's
-  own syncs (connect, onboarding, the nightly run) while they exist.
+- Each half is one transaction under the company's sync lock (`sync.lock`, Flask's key),
+  `pg_advisory_xact_lock(hashtextextended('xero-sync:<entity>', 0))`, so two syncs of one company
+  never overlap.
+- **Lock order: the sync lock first, then the company row** (production deadlock, 2026-11-26). A
+  write under the sync lock to a table with a foreign key to `entities` takes `FOR KEY SHARE` on the
+  company row. So a transaction that held that row `FOR UPDATE` and then waited for the sync lock
+  deadlocked with the running sync (`sync_during_change`, on a company changing its matches). Every
+  `select_for_update` of the company (matching's `start_change`, `cancel_change`,
+  `sync_during_change`, `finish`) now takes `sync.lock` first.
 
-Tests: `xero/tests/test_sync.py` (Postgres only).
+Tests: `xero/tests/test_sync.py`, `hub/tests/test_xero_lock_order.py` (Postgres only).
 
 ## The hub and the public routes (Phase 5, 2026-11-06; built and tested locally, not deployed)
 
@@ -572,7 +578,7 @@ pointing at nothing.
   matching is open the sync refreshes only the copies. **While the matches are being changed** (the
   user, 2026-11-24; production: a change left open from 19 Nov kept 58 Xero accounts out of a company
   for days) the sync takes Xero's new accounts in as on any sync (`matching.sync_during_change`, under
-  the company row's lock like Finish): one the change already gives to an account is not added beside
+  the sync lock and then the company row's lock, like Finish): one the change already gives to an account is not added beside
   it (`apply_accounts(skip=...)`; Finish links it), and each new one starts matched to itself
   (`_prefill_links`), so it never blocks Finish. **Every Finish starts the background sync**, a
   change's too, so Xero's accounts arrive at once. Tests: `hub/tests/test_xero_matching.py`,

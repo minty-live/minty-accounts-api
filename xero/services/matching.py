@@ -643,6 +643,7 @@ def start_change(entity_id) -> dict:
     """Change the matches (Phase 3): a connected company's matching page again, each account on its
     current Xero account. The company stays connected; publishing goes on."""
     with transaction.atomic():
+        sync.lock(entity_id)  # before the company row: the lock order (``sync.lock``)
         entity = Entity.objects.select_for_update().get(id=entity_id)
         if entity.xero_matching:
             raise Refused(ALREADY_OPEN)
@@ -660,6 +661,7 @@ def start_change(entity_id) -> dict:
 def cancel_change(entity_id) -> dict:
     """Leave a change of matches: nothing changed, the picks dropped."""
     with transaction.atomic():
+        sync.lock(entity_id)  # before the company row: the lock order (``sync.lock``)
         entity = Entity.objects.select_for_update().get(id=entity_id)
         if entity.xero_matching != "change":
             raise Refused(NOT_CHANGING)
@@ -673,13 +675,15 @@ def sync_during_change(entity_id, accounts: list[dict], org) -> dict:
     """A sync while the matches are being changed (the user, 2026-11-24): Xero's accounts come in as
     on any sync, except one the change already gives to an account (Finish links it there), and each
     new one starts matched to itself, so it never blocks Finish. Holds the company row, as Finish
-    does, so the two never interleave; a change Finish or Cancel closed meanwhile is an ordinary sync."""
+    does, so the two never interleave; a change Finish or Cancel closed meanwhile is an ordinary sync.
+    The sync lock comes first (``sync.lock``): taken after the company row, it deadlocked with another
+    sync of the company (production, 2026-11-26)."""
     with transaction.atomic():
+        sync.lock(entity_id)
         entity = Entity.objects.select_for_update().get(id=entity_id)
         if entity.xero_matching != "change":
             if entity.xero_matching is None and entity.setup_mode == "xero":
                 return sync.apply_accounts(entity_id, accounts, org)
-            sync.lock(entity_id)
             sync._copy_accounts(entity_id, {a["AccountID"]: a for a in accounts if a.get("AccountID")}, org)
             return {"copied": len(accounts)}
         picked = AccountMatchDraft.objects.filter(entity_id=entity_id).values_list("xero_account_id", flat=True)
@@ -902,11 +906,11 @@ def finish(entity_id, user_id) -> dict:
     written, while an account has no pick, two share a Xero account, a pick names a Xero account or
     contact that is gone, or a contact the step asks has no answer."""
     with transaction.atomic():
+        sync.lock(entity_id)  # before the company row: the lock order (``sync.lock``)
         entity = Entity.objects.select_for_update().get(id=entity_id)
         if not accounts_pending(entity):
             raise Refused(NOT_PENDING)
         reason = entity.xero_matching
-        sync.lock(entity_id)
         # Two accounts may swap Xero accounts (Phase 3's change): the one-active-link rule and the
         # active code/name rules are deferrable, checked at COMMIT.
         if connection.vendor == "postgresql":
