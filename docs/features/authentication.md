@@ -51,7 +51,9 @@ site (`hub/session.safe_internal_path`) and drains the flashed messages into a s
 
 1. `POST /auth/email/request-code` - in login mode (`mode: "login"`) an unknown address is
    refused **before** a code is sent (404 "You haven't signed up yet. Click Continue to start
-   sign-up." with `action: "signup"`; since 2026-11-26 the sign-in page asks, and Continue opens
+   sign-up." with `action: "signup"`; every sign-in refusal logs `sign-in refused <status>:
+   <sentence>` at INFO (a 429 lock at WARNING) and no Django "Not Found: <path>" warning, since
+   2026-11-27; never the address. Since 2026-11-26 the sign-in page asks, and Continue opens
    `/signup` with the address filled in - names, Terms, a new code, then the account), by the same rule verify signs
    in by (`resolve_user_by_email`: `user.email` or `user.xero_email`; a `username` alone does
    not count). A 6-digit code, valid **60 s**, resend cooldown 60 s. Failed tries carry across

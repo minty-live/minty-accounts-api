@@ -363,3 +363,49 @@ def test_someone_else_signed_in_is_signed_out_before_the_invitation(invited):
     query = sign_in_page(client.get(f"/invitation/accept/{invitation.token}"))
     assert query["invite"] == [invitation.token]
     assert client.get("/")["Location"].startswith(HUB + "/login")  # signed out
+
+
+# ---- a refusal logs its sentence, not Django's "Not Found: <path>" (production, 2026-11-26) ---------
+
+
+def _signin_lines(caplog):
+    """(level, message) of the sign-in refusals, and of anything django.request logged."""
+    return [(r.levelname, r.getMessage()) for r in caplog.records
+            if r.name == "django.request" or r.getMessage().startswith("sign-in refused")]
+
+
+def test_an_unknown_address_in_log_in_mode_is_an_info_line_not_a_not_found_warning(db, caplog):
+    with caplog.at_level("INFO"):
+        assert ask(Client(), "stranger@test.com", mode="login").status_code == 404
+    assert _signin_lines(caplog) == [
+        ("INFO", "sign-in refused 404: You haven't signed up yet. Click Continue to start sign-up.")]
+    assert "stranger@test.com" not in caplog.text, "the address is never logged"
+
+
+def test_a_new_address_with_no_name_at_the_code_check_is_an_info_line(db, caplog):
+    client = Client()
+    ask(client, "new@test.com")
+    with caplog.at_level("INFO"):
+        assert verify(client, "new@test.com").status_code == 404
+    assert _signin_lines(caplog) == [("INFO", "sign-in refused 404: No account found for this email — please sign up.")]
+
+
+def test_a_locked_code_stays_a_warning(db, caplog):
+    make_user()
+    client = Client()
+    ask(client, "owner@test.com")
+    for _ in range(email_signin.MAX_OTP_ATTEMPTS - 1):
+        verify(client, "owner@test.com", "000000")
+    caplog.clear()
+    with caplog.at_level("INFO"):
+        locked = verify(client, "owner@test.com", "000000")
+    assert locked.status_code == 429
+    lines = _signin_lines(caplog)
+    assert len(lines) == 1 and lines[0][0] == "WARNING" and lines[0][1].startswith("sign-in refused 429: Too many attempts")
+
+
+def test_a_code_sent_logs_no_refusal(db, caplog):
+    make_user()
+    with caplog.at_level("INFO"):
+        assert ask(Client(), "owner@test.com", mode="login").status_code == 200
+    assert _signin_lines(caplog) == []

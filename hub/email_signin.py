@@ -226,7 +226,16 @@ def redeem_handoff(token: str) -> dict | None:
 
 
 def _answer(request: HttpRequest, payload: dict, status: int = 200) -> HttpResponse:
-    return _open_cors(request, flask_json(payload, status))
+    response = _open_cors(request, flask_json(payload, status))
+    if status >= 400:
+        # A refusal is an answer, not a missing page (production, 2026-11-26): Django's
+        # "Not Found: /auth/email/request-code" warning on every unknown address read like a
+        # broken route. Ours names the sentence (fixed text, never the address); a locked code
+        # (429, a possible guessing attack) stays a warning.
+        response._has_been_logged = True
+        (logger.warning if status == 429 else logger.info)(
+            "sign-in refused %s: %s", status, payload.get("message"))
+    return response
 
 
 def _error(request: HttpRequest, message: str, status: int) -> HttpResponse:
